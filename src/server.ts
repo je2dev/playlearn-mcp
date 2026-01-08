@@ -281,8 +281,12 @@ server.tool(
 const app = express();
 app.use(express.json());
 
-app.get("/", (_req, res) => {
-  res.status(200).send("playlearn-mcp is running");
+app.get("/", (req, res) => {
+  res.status(200).send("OK");
+});
+
+app.get("/health", (req, res) => {
+  res.status(200).json({ok: true });
 });
 
 // 세션 관리 (메모리 누수 방지)
