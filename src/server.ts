@@ -5,20 +5,21 @@ import { randomUUID } from "crypto";
 import { createClient } from "@supabase/supabase-js";
 import { z } from "zod";
 
-// ✅ MCP SDK (HTTP)
+// ✅ MCP SDK (HTTP/SSE)
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 
-const SUPABASE_URL = process.env.SUPABASE_URL!;
-const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY!;
+/* ----------------------------- ENV / SUPABASE ----------------------------- */
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
 if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
-  throw new Error("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY in .env");
+  throw new Error("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY in environment variables");
 }
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
-// -------- Zod --------
+/* ---------------------------------- Zod ---------------------------------- */
 const ModeEnum = z.enum(["toeic", "grammar", "travel", "business", "vocab"]);
 const SignalEnum = z.enum(["hard", "easy", "neutral"]).optional();
 
@@ -38,7 +39,8 @@ const SaveItemArgs = z.object({
   user_id: z.string().min(1),
   item_type: z.enum(["vocab", "mistake", "note"]),
   key: z.string().min(1),
-  payload: z.record(z.string(), z.any()), // zod v4: (keyType, valueType)
+  // 안전하게 가려면 z.unknown() 권장. (유연함 유지하려면 z.any()도 OK)
+  payload: z.record(z.string(), z.unknown()),
 });
 
 const GetReviewItemsArgs = z.object({
@@ -52,26 +54,42 @@ const GetLearningSummaryArgs = z.object({
   days: z.number().int().min(1).max(365).default(7),
 });
 
-// -------- Helpers --------
+/* -------------------------------- Helpers -------------------------------- */
 async function ensureUser(user_id: string) {
-  const { data } = await supabase
+  const { data, error } = await supabase
     .from("users")
     .select("user_id")
     .eq("user_id", user_id)
     .maybeSingle();
 
+  if (error) throw error;
   if (data) return;
 
-  const { error } = await supabase.from("users").insert({
+  const { error: insErr } = await supabase.from("users").insert({
     user_id,
     current_level: 3,
     last_mode: null,
   });
 
-  if (error) throw error;
+  if (insErr) throw insErr;
 }
 
-// -------- MCP Server --------
+function mustAcceptSseAndJson(req: Request) {
+  // MCP Streamable HTTP는 클라이언트가 둘 다 accept 해야 함
+  const accept = String(req.headers["accept"] ?? "");
+  return accept.includes("text/event-stream") && accept.includes("application/json");
+}
+
+function safeJsonRpcError(res: Response, message = "Internal Server Error") {
+  // MCP/JSON-RPC 스타일로 최소만 노출
+  res.status(500).json({
+    jsonrpc: "2.0",
+    error: { code: -32000, message },
+    id: null,
+  });
+}
+
+/* ------------------------------- MCP Server ------------------------------- */
 const server = new McpServer({ name: "playlearn-mcp", version: "1.0.0" });
 
 // Tool: get_question
@@ -93,21 +111,18 @@ server.tool(
 
     if (error) throw error;
     if (!data || data.length === 0) {
-      return {
-        content: [{ type: "text", text: "해당 모드/레벨에 활성화된 문제가 없습니다." }],
-      };
+      return { content: [{ type: "text", text: "해당 모드/레벨에 활성화된 문제가 없습니다." }] };
     }
 
-    const q = data[0];
+    const q = data[0] as any;
     const choices = (q.choices ?? []) as string[];
-
     const mediaMd = q.media?.image ? `\n\n![image](${q.media.image})\n` : "";
 
     const text =
 `🧩 **문제 (${q.mode} / Lv.${q.level})**
 ${q.prompt}${mediaMd}
 
-${choices.length ? choices.map((c, i) => `${i + 1}. ${c}`).join("\n") : "(선택지가 없습니다)"}
+${choices.length ? choices.map((c: string, i: number) => `${i + 1}. ${c}`).join("\n") : "(선택지가 없습니다)"}
 
 q_id: \`${q.q_id}\``;
 
@@ -140,14 +155,14 @@ server.tool(
       return { content: [{ type: "text", text: "해당 q_id 문제를 찾지 못했습니다." }] };
     }
 
-    const isCorrect = user_answer.trim() === String(q.answer).trim();
+    const isCorrect = user_answer.trim() === String((q as any).answer).trim();
 
     const { error: logErr } = await supabase.from("study_logs").insert({
       user_id,
       event_type: "quiz_attempt",
-      ref_id: String(q.q_id),
-      mode: q.mode,
-      level: q.level,
+      ref_id: String((q as any).q_id),
+      mode: (q as any).mode,
+      level: (q as any).level,
       is_correct: isCorrect,
       signal: signal ?? "neutral",
     });
@@ -157,8 +172,8 @@ server.tool(
     const text =
 `${isCorrect ? "✅ 정답" : "❌ 오답"}
 
-- 정답: **${q.answer}**
-- 해설: ${q.explanation}
+- 정답: **${(q as any).answer}**
+- 해설: ${(q as any).explanation}
 - 신호: ${signal ?? "neutral"}`;
 
     return { content: [{ type: "text", text }] };
@@ -173,7 +188,7 @@ server.tool(
     user_id: z.string(),
     item_type: z.enum(["vocab", "mistake", "note"]),
     key: z.string(),
-    payload: z.record(z.string(), z.any()),
+    payload: z.record(z.string(), z.unknown()),
   },
   async (args) => {
     const { user_id, item_type, key, payload } = SaveItemArgs.parse(args);
@@ -225,7 +240,7 @@ server.tool(
 (data && data.length
   ? "\n" +
     data
-      .map((it, idx) => `${idx + 1}) [${it.item_type}] **${it.key}**\n- payload: ${JSON.stringify(it.payload)}`)
+      .map((it: any, idx: number) => `${idx + 1}) [${it.item_type}] **${it.key}**\n- payload: ${JSON.stringify(it.payload)}`)
       .join("\n")
   : "\n(없음)");
 
@@ -254,7 +269,7 @@ server.tool(
     if (aErr) throw aErr;
 
     const total = attempts?.length ?? 0;
-    const wrong = (attempts ?? []).filter((x) => x.is_correct === false).length;
+    const wrong = (attempts ?? []).filter((x: any) => x.is_correct === false).length;
 
     const { data: saved, error: sErr } = await supabase
       .from("review_items")
@@ -265,7 +280,7 @@ server.tool(
     if (sErr) throw sErr;
 
     const savedTotal = saved?.length ?? 0;
-    const savedVocab = (saved ?? []).filter((x) => x.item_type === "vocab").length;
+    const savedVocab = (saved ?? []).filter((x: any) => x.item_type === "vocab").length;
 
     const text =
 `📊 최근 ${days}일 요약
@@ -277,23 +292,23 @@ server.tool(
   }
 );
 
-// -------- HTTP Endpoint (PlayMCP/Render가 물리는 부분) --------
+/* ------------------------------- Express App ------------------------------ */
 const app = express();
-app.use(express.json());
 
-app.get("/", (req, res) => {
-  res.status(200).send("OK");
-});
+// JSON 파싱 (MCP POST body용)
+app.use(express.json({ limit: "1mb" }));
 
-app.get("/health", (req, res) => {
-  res.status(200).json({ok: true });
-});
+// 단순 헬스체크 (Render에서 timeout 방지/확인용)
+app.get("/", (_req, res) => res.status(200).send("ok"));
+app.get("/health", (_req, res) => res.status(200).json({ ok: true }));
 
-// 세션 관리 (메모리 누수 방지)
+/* -------------------------- Session / Transport Store --------------------- */
+// 주의: Render Free는 인스턴스가 자주 sleep/재시작 → 메모리 세션은 사라질 수 있음(정상)
 const transports: Record<string, StreamableHTTPServerTransport> = {};
 const sessionsLastSeen: Record<string, number> = {};
 const SESSION_TTL_MS = 1000 * 60 * 30; // 30분
 
+// 5분마다 오래된 세션 정리
 setInterval(() => {
   const now = Date.now();
   for (const [sid, last] of Object.entries(sessionsLastSeen)) {
@@ -302,55 +317,88 @@ setInterval(() => {
       delete transports[sid];
     }
   }
-}, 1000 * 60 * 5); // 5분마다 청소
+}, 1000 * 60 * 5);
 
-app.get("/", (_req, res) => res.status(200).send("ok"));
-app.get("/health", (_req, res) => res.status(200).json({ ok: true }));
+/* ---------------------------------- MCP ---------------------------------- */
+app.post("/mcp", async (req: Request, res: Response) => {
+  try {
+    // MCP는 Accept 헤더 필수
+    if (!mustAcceptSseAndJson(req)) {
+      res.status(406).json({
+        jsonrpc: "2.0",
+        error: {
+          code: -32000,
+          message: "Not Acceptable: Client must accept both application/json and text/event-stream",
+        },
+        id: null,
+      });
+      return;
+    }
 
-app.post("/mcp", async (req, res) => {
-  const incomingSessionId = (req.headers["mcp-session-id"] as string) || "";
+    const incomingSessionId = (req.headers["mcp-session-id"] as string) || "";
+    let transport = incomingSessionId ? transports[incomingSessionId] : undefined;
 
-  let transport = incomingSessionId ? transports[incomingSessionId] : undefined;
+    if (!transport) {
+      const newSessionId = randomUUID();
 
-  if (!transport) {
-    // ✅ 서버가 새 세션을 만든다
-    const newSessionId = randomUUID();
+      transport = new StreamableHTTPServerTransport({
+        sessionIdGenerator: () => newSessionId,
+      });
 
-    transport = new StreamableHTTPServerTransport({
-      sessionIdGenerator: () => newSessionId,
-    });
+      transports[newSessionId] = transport;
+      sessionsLastSeen[newSessionId] = Date.now();
 
-    // ✅ 매핑 저장
-    transports[newSessionId] = transport;
+      await server.connect(transport);
 
-    // ✅ 연결
-    await server.connect(transport);
+      // 클라이언트에게 세션 id 전달
+      res.setHeader("mcp-session-id", newSessionId);
+    } else {
+      sessionsLastSeen[incomingSessionId] = Date.now();
+    }
 
-    // ✅ 클라이언트에게 세션 id 알려줌
-    res.setHeader("mcp-session-id", newSessionId);
+    await transport.handleRequest(req, res, req.body);
+  } catch (err) {
+    console.error("[/mcp POST] error:", err);
+    safeJsonRpcError(res);
   }
-
-  await transport.handleRequest(req, res, req.body);
 });
 
 app.get("/mcp", async (req: Request, res: Response) => {
-  const sessionId = (req.headers["mcp-session-id"] as string) || "";
-  if (!sessionId) {
-    res.status(400).json({ error: "Missing mcp-session-id" });
-    return;
+  try {
+    if (!mustAcceptSseAndJson(req)) {
+      res.status(406).json({
+        jsonrpc: "2.0",
+        error: {
+          code: -32000,
+          message: "Not Acceptable: Client must accept both application/json and text/event-stream",
+        },
+        id: null,
+      });
+      return;
+    }
+
+    const sessionId = (req.headers["mcp-session-id"] as string) || "";
+    if (!sessionId) {
+      res.status(400).json({ error: "Missing mcp-session-id" });
+      return;
+    }
+
+    sessionsLastSeen[sessionId] = Date.now();
+
+    const transport = transports[sessionId];
+    if (!transport) {
+      res.status(404).json({ error: "Session not found" });
+      return;
+    }
+
+    await transport.handleRequest(req, res);
+  } catch (err) {
+    console.error("[/mcp GET] error:", err);
+    safeJsonRpcError(res);
   }
-
-  sessionsLastSeen[sessionId] = Date.now();
-
-  const transport = transports[sessionId];
-  if (!transport) {
-    res.status(404).json({ error: "Session not found" });
-    return;
-  }
-
-  await transport.handleRequest(req, res);
 });
 
+/* --------------------------------- Listen -------------------------------- */
 const PORT = Number(process.env.PORT || 3000);
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`✅ MCP HTTP Server running: http://0.0.0.0:${PORT}/mcp`);

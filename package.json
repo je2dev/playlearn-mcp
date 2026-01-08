@@ -2,12 +2,12 @@
   "name": "playlearn-mcp",
   "version": "1.0.0",
   "type": "module",
-  "engines": { "node": "20.x" },
   "private": true,
+  "engines": { "node": "20.x" },
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "dev": "node --loader ts-node/esm src/server.ts",
-    "start": "node dist/server.js"
+    "start": "node dist/server.js",
+    "dev": "node --loader ts-node/esm src/server.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.25.2",
