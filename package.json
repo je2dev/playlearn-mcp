@@ -2,6 +2,7 @@
   "name": "playlearn-mcp",
   "version": "1.0.0",
   "type": "module",
+  "engines": { "node": "20.x" },
   "private": true,
   "scripts": {
     "build": "tsc -p tsconfig.json",

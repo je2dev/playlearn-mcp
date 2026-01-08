@@ -304,6 +304,9 @@ setInterval(() => {
   }
 }, 1000 * 60 * 5); // 5분마다 청소
 
+app.get("/", (_req, res) => res.status(200).send("ok"));
+app.get("/health", (_req, res) => res.status(200).json({ ok: true }));
+
 app.post("/mcp", async (req, res) => {
   const incomingSessionId = (req.headers["mcp-session-id"] as string) || "";
 
@@ -350,5 +353,5 @@ app.get("/mcp", async (req: Request, res: Response) => {
 
 const PORT = Number(process.env.PORT || 3000);
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(`✅ listening on 0.0.0.0:${PORT}`);
+  console.log(`✅ MCP HTTP Server running: http://0.0.0.0:${PORT}/mcp`);
 });
