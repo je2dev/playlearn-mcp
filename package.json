@@ -2,24 +2,19 @@
   "name": "playlearn-mcp",
   "version": "1.0.0",
   "type": "module",
-  "description": "",
-  "main": "index.js",
+  "private": true,
   "scripts": {
-    "dev": "node --loader ts-node/esm src/server.ts"
+    "dev": "node --loader ts-node/esm src/server.ts",
+    "start": "node --loader ts-node/esm src/server.ts"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.25.2",
     "@supabase/supabase-js": "^2.90.1",
-    "cors": "^2.8.5",
     "dotenv": "^17.2.3",
     "express": "^5.2.1",
     "zod": "^4.3.5"
   },
   "devDependencies": {
-    "@types/cors": "^2.8.19",
     "@types/express": "^5.0.6",
     "@types/node": "^25.0.3",
     "ts-node": "^10.9.2",

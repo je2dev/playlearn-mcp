@@ -1,5 +1,6 @@
+// src/server.ts
 import "dotenv/config";
-import express from "express";
+import express, { type Request, type Response } from "express";
 import { randomUUID } from "crypto";
 import { createClient } from "@supabase/supabase-js";
 import { z } from "zod";
@@ -37,7 +38,7 @@ const SaveItemArgs = z.object({
   user_id: z.string().min(1),
   item_type: z.enum(["vocab", "mistake", "note"]),
   key: z.string().min(1),
-  payload: z.record(z.string(), z.any()), // zod v4 형식
+  payload: z.record(z.string(), z.any()), // zod v4: (keyType, valueType)
 });
 
 const GetReviewItemsArgs = z.object({
@@ -66,6 +67,7 @@ async function ensureUser(user_id: string) {
     current_level: 3,
     last_mode: null,
   });
+
   if (error) throw error;
 }
 
@@ -80,27 +82,26 @@ server.tool(
   async (args) => {
     const { mode, level } = GetQuestionArgs.parse(args);
 
-    // ✅ service 컬럼이 있는 스키마니까, 필요하면 서비스명으로도 필터
     const { data, error } = await supabase
       .from("questions")
       .select("q_id, mode, level, prompt, choices, answer, explanation, media")
       .eq("mode", mode)
       .eq("level", level)
       .eq("is_active", true)
-      // .eq("service", "playlearn-core") // 필요하면 주석 해제
       .order("created_at", { ascending: false })
       .limit(1);
 
     if (error) throw error;
     if (!data || data.length === 0) {
-      return { content: [{ type: "text", text: "해당 모드/레벨에 활성화된 문제가 없습니다." }] };
+      return {
+        content: [{ type: "text", text: "해당 모드/레벨에 활성화된 문제가 없습니다." }],
+      };
     }
 
     const q = data[0];
     const choices = (q.choices ?? []) as string[];
 
-    const mediaMd =
-      q.media?.image ? `\n\n![image](${q.media.image})\n` : "";
+    const mediaMd = q.media?.image ? `\n\n![image](${q.media.image})\n` : "";
 
     const text =
 `🧩 **문제 (${q.mode} / Lv.${q.level})**
@@ -150,6 +151,7 @@ server.tool(
       is_correct: isCorrect,
       signal: signal ?? "neutral",
     });
+
     if (logErr) throw logErr;
 
     const text =
@@ -163,7 +165,7 @@ server.tool(
   }
 );
 
-// Tool: save_item  (review_items 테이블 사용)
+// Tool: save_item
 server.tool(
   "save_item",
   "단어/오답/메모를 review_items에 저장합니다.",
@@ -178,7 +180,7 @@ server.tool(
     await ensureUser(user_id);
 
     const { error } = await supabase.from("review_items").insert({
-      item_id: randomUUID(),      // 네 review_items가 uuid PK라서 서버가 생성
+      item_id: randomUUID(),
       user_id,
       item_type,
       key,
@@ -214,18 +216,17 @@ server.tool(
 
     if (parsed.item_type) query = query.eq("item_type", parsed.item_type);
 
-    const { data, error } = await query
-      .order("last_seen_at", { ascending: true })
-      .limit(parsed.limit);
+    const { data, error } = await query.order("last_seen_at", { ascending: true }).limit(parsed.limit);
 
     if (error) throw error;
 
     const text =
 `📌 복습 아이템 (${data?.length ?? 0}개)` +
 (data && data.length
-  ? "\n" + data.map((it, idx) =>
-      `${idx + 1}) [${it.item_type}] **${it.key}**\n- payload: ${JSON.stringify(it.payload)}`
-    ).join("\n")
+  ? "\n" +
+    data
+      .map((it, idx) => `${idx + 1}) [${it.item_type}] **${it.key}**\n- payload: ${JSON.stringify(it.payload)}`)
+      .join("\n")
   : "\n(없음)");
 
     return { content: [{ type: "text", text }] };
@@ -276,41 +277,66 @@ server.tool(
   }
 );
 
-// -------- HTTP Endpoint (PlayMCP가 물리는 부분) --------
+// -------- HTTP Endpoint (PlayMCP/Render가 물리는 부분) --------
 const app = express();
 app.use(express.json());
 
+// 세션 관리 (메모리 누수 방지)
 const transports: Record<string, StreamableHTTPServerTransport> = {};
+const sessionsLastSeen: Record<string, number> = {};
+const SESSION_TTL_MS = 1000 * 60 * 30; // 30분
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [sid, last] of Object.entries(sessionsLastSeen)) {
+    if (now - last > SESSION_TTL_MS) {
+      delete sessionsLastSeen[sid];
+      delete transports[sid];
+    }
+  }
+}, 1000 * 60 * 5); // 5분마다 청소
 
 app.post("/mcp", async (req, res) => {
-  const sessionId = (req.headers["mcp-session-id"] as string) || "";
+  const incomingSessionId = (req.headers["mcp-session-id"] as string) || "";
 
-  let transport = transports[sessionId];
+  let transport = incomingSessionId ? transports[incomingSessionId] : undefined;
+
   if (!transport) {
+    // ✅ 서버가 새 세션을 만든다
+    const newSessionId = randomUUID();
+
     transport = new StreamableHTTPServerTransport({
-      sessionIdGenerator: () => randomUUID(),
+      sessionIdGenerator: () => newSessionId,
     });
+
+    // ✅ 매핑 저장
+    transports[newSessionId] = transport;
+
+    // ✅ 연결
     await server.connect(transport);
 
-    // 새 세션 id를 저장(내부 필드라 any로 접근)
-    const newSessionId = (transport as any)._sessionId as string | undefined;
-    if (newSessionId) transports[newSessionId] = transport;
+    // ✅ 클라이언트에게 세션 id 알려줌
+    res.setHeader("mcp-session-id", newSessionId);
   }
 
-  // ✅ POST는 body를 3번째 인자로 전달
   await transport.handleRequest(req, res, req.body);
 });
 
-app.get("/mcp", async (req, res) => {
+app.get("/mcp", async (req: Request, res: Response) => {
   const sessionId = (req.headers["mcp-session-id"] as string) || "";
-  const transport = transports[sessionId];
+  if (!sessionId) {
+    res.status(400).json({ error: "Missing mcp-session-id" });
+    return;
+  }
 
+  sessionsLastSeen[sessionId] = Date.now();
+
+  const transport = transports[sessionId];
   if (!transport) {
     res.status(404).json({ error: "Session not found" });
     return;
   }
 
-  // ✅ GET은 (req,res)만
   await transport.handleRequest(req, res);
 });
 
