@@ -345,6 +345,6 @@ app.get("/mcp", async (req: Request, res: Response) => {
 });
 
 const PORT = Number(process.env.PORT || 3000);
-app.listen(PORT, () => {
-  console.log(`✅ MCP HTTP Server running: http://localhost:${PORT}/mcp`);
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`✅ listening on 0.0.0.0:${PORT}`);
 });
