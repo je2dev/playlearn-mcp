@@ -131,6 +131,7 @@ q_id: \`${q.q_id}\``;
 );
 
 // Tool: submit_answer
+// Tool: submit_answer
 server.tool(
   "submit_answer",
   "정답 체크 + study_logs 저장 + 사용자의 신호(hard/easy/neutral) 기록",
@@ -141,42 +142,106 @@ server.tool(
     signal: z.enum(["hard", "easy", "neutral"]).optional(),
   },
   async (args) => {
-    const { user_id, q_id, user_answer, signal } = SubmitAnswerArgs.parse(args);
-    await ensureUser(user_id);
+    try {
+      const { user_id, q_id, user_answer, signal } = SubmitAnswerArgs.parse(args);
+      await ensureUser(user_id);
 
-    const { data: q, error: qErr } = await supabase
-      .from("questions")
-      .select("q_id, mode, level, answer, explanation")
-      .eq("q_id", q_id)
-      .maybeSingle();
+      // ✅ choices까지 같이 가져와서 1/A 같은 입력도 처리 가능하게
+      const { data: q, error: qErr } = await supabase
+        .from("questions")
+        .select("q_id, mode, level, answer, explanation, choices")
+        .eq("q_id", q_id)
+        .maybeSingle();
 
-    if (qErr) throw qErr;
-    if (!q) {
-      return { content: [{ type: "text", text: "해당 q_id 문제를 찾지 못했습니다." }] };
-    }
+      if (qErr) throw qErr;
+      if (!q) {
+        return { content: [{ type: "text", text: "해당 q_id 문제를 찾지 못했습니다." }], isError: true };
+      }
 
-    const isCorrect = user_answer.trim() === String((q as any).answer).trim();
+      const choices = (q.choices ?? []) as string[];
 
-    const { error: logErr } = await supabase.from("study_logs").insert({
-      user_id,
-      event_type: "quiz_attempt",
-      ref_id: String((q as any).q_id),
-      mode: (q as any).mode,
-      level: (q as any).level,
-      is_correct: isCorrect,
-      signal: signal ?? "neutral",
-    });
+      // ---- 답안 정규화: "1" / "A" 둘 다 허용 ----
+      const raw = String(user_answer).trim();
+      const upper = raw.toUpperCase();
 
-    if (logErr) throw logErr;
+      let userPickIndex: number | null = null;
 
-    const text =
+      // 숫자 "1" -> index 0
+      if (/^\d+$/.test(raw)) {
+        const n = Number(raw);
+        if (Number.isFinite(n) && n >= 1) userPickIndex = n - 1;
+      }
+
+      // 알파 "A" -> index 0
+      const alpha = { A: 0, B: 1, C: 2, D: 3, E: 4 } as const;
+      if (upper in alpha) userPickIndex = alpha[upper as keyof typeof alpha];
+
+      // userPickValue: choices가 있으면 실제 선택지 텍스트로, 아니면 raw
+      const userPickValue =
+        userPickIndex !== null && choices[userPickIndex] != null
+          ? String(choices[userPickIndex]).trim()
+          : raw;
+
+      // answer가 숫자(인덱스/번호)인지 텍스트인지 둘 다 대응
+      const ansRaw = q.answer;
+      const ansStr = String(ansRaw).trim();
+
+      // 1) answer가 "1" 같은 번호로 저장된 경우
+      let isCorrect = false;
+      if (/^\d+$/.test(ansStr) && userPickIndex !== null) {
+        // answer가 "1"이면 index 0과 매칭
+        const ansIndex = Number(ansStr) - 1;
+        isCorrect = ansIndex === userPickIndex;
+      } else {
+        // 2) answer가 텍스트(예: "A" 또는 선택지 문장)인 경우
+        // - answer가 "A"면 알파 인덱스로 비교도 한 번 더
+        if (ansStr.length === 1 && ansStr.toUpperCase() in alpha && userPickIndex !== null) {
+          isCorrect = alpha[ansStr.toUpperCase() as keyof typeof alpha] === userPickIndex;
+        } else {
+          // - 마지막은 텍스트 비교
+          isCorrect = userPickValue === ansStr || raw === ansStr;
+        }
+      }
+
+      // ✅ 로그 저장 (여기서 컬럼명이 다르면 바로 에러 메시지로 드러남)
+      const { error: logErr } = await supabase.from("study_logs").insert({
+        user_id,
+        event_type: "quiz_attempt",
+        ref_id: String(q.q_id),
+        mode: q.mode,
+        level: q.level,
+        is_correct: isCorrect,
+        signal: signal ?? "neutral",
+        // 선택: 디버깅용으로 남기고 싶으면 컬럼 있을 때만
+        // user_answer: raw,
+      });
+
+      if (logErr) throw logErr;
+
+      const text =
 `${isCorrect ? "✅ 정답" : "❌ 오답"}
 
-- 정답: **${(q as any).answer}**
-- 해설: ${(q as any).explanation}
+- 내가 보낸 답: ${raw}
+- 해석된 선택: ${userPickIndex !== null ? `${userPickIndex + 1}번` : "(해석불가)"} ${choices[userPickIndex ?? -1] ? `(${choices[userPickIndex ?? -1]})` : ""}
+- 정답(저장값): ${ansStr}
+- 해설: ${q.explanation ?? "(해설 없음)"}
 - 신호: ${signal ?? "neutral"}`;
 
-    return { content: [{ type: "text", text }] };
+      return { content: [{ type: "text", text }] };
+    } catch (err: any) {
+      // ✅ 여기 때문에 앞으로 [object Object] 안 뜨고 진짜 원인이 보임
+      const msg =
+        err?.message
+          ? err.message
+          : typeof err === "string"
+            ? err
+            : JSON.stringify(err, null, 2);
+
+      return {
+        content: [{ type: "text", text: `submit_answer 실패: ${msg}` }],
+        isError: true,
+      };
+    }
   }
 );
 
