@@ -356,6 +356,8 @@ server.tool(
         mode,
         level: Q.level,
         is_correct: graded.isCorrect,
+        // ✅ 사용자 답안 저장 (가능하면 해석된 선택지, 없으면 raw, 최후엔 원본)
+        user_answer: graded.userPickValue ?? graded.raw ?? user_answer,
         signal: signal ?? "neutral",
       });
       if (logErr) throw logErr;
@@ -550,7 +552,7 @@ server.tool(
       });
 
       // ✅ 로그 저장
-      const { error: logErr } = await supabase.from("study_logs").insert({
+  const { error: logErr } = await supabase.from("study_logs").insert({
         user_id,
         q_id: QQ.q_id,
         event_type: "quiz_attempt",
@@ -558,8 +560,11 @@ server.tool(
         mode: QQ.mode,
         level: QQ.level,
         is_correct: graded.isCorrect,
+        // ✅ 여기서도 반드시 저장
+        user_answer: graded.userPickValue ?? graded.raw ?? user_answer,
         signal: signal ?? "neutral",
       });
+      
       if (logErr) throw logErr;
 
       const dbgPicked =
