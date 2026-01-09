@@ -5,11 +5,12 @@ import { randomUUID } from "crypto";
 import { createClient } from "@supabase/supabase-js";
 import { z } from "zod";
 
-// ✅ MCP SDK (HTTP/SSE)
+// MCP SDK (HTTP/SSE)
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 
 /* ----------------------------- ENV / SUPABASE ----------------------------- */
+
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
@@ -20,7 +21,10 @@ if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
 /* ---------------------------------- Zod ---------------------------------- */
+
 const ModeEnum = z.enum(["toeic", "grammar", "travel", "business", "vocab"]);
+type Mode = z.infer<typeof ModeEnum>;
+
 const SignalEnum = z.enum(["hard", "easy", "neutral"]).optional();
 
 const GetQuestionArgs = z.object({
@@ -53,7 +57,7 @@ const GetLearningSummaryArgs = z.object({
   days: z.number().int().min(1).max(365).default(7),
 });
 
-// ✅ 추가: 진단(placement) 관련
+// 진단(placement) 관련
 const GetUserStateArgs = z.object({
   user_id: z.string().min(1),
 });
@@ -72,7 +76,8 @@ const PlacementSubmitArgs = z.object({
 });
 
 /* -------------------------------- Helpers -------------------------------- */
-async function ensureUser(user_id: string) {
+
+async function ensureUser(user_id: string, mode?: Mode) {
   const { data, error } = await supabase
     .from("users")
     .select("user_id")
@@ -82,37 +87,77 @@ async function ensureUser(user_id: string) {
   if (error) throw error;
   if (data) return;
 
+  // last_mode NOT NULL인 상황도 커버하기 위해 기본값 toeic 사용
   const { error: insErr } = await supabase.from("users").insert({
     user_id,
     current_level: 3,
     exp_points: 0,
     placement_done: false,
-    last_mode: null,
+    last_mode: mode ?? "toeic",
   });
 
   if (insErr) throw insErr;
 }
 
-// ✅ 추가: "1" / "A" 둘 다 인덱스로 정규화
-function normalizeChoiceAnswer(input: string) {
-  const raw = String(input ?? "").trim();
-  const up = raw.toUpperCase();
+// 객관식 답안 채점 공통 로직
+function gradeAnswer(opts: {
+  choices: string[];
+  correctAnswer: unknown; // DB answer (번호/문자/텍스트 다 가능)
+  userAnswer: string; // "1" / "A" / 텍스트
+}) {
+  const { choices, correctAnswer, userAnswer } = opts;
 
-  // 숫자면 1-index -> 0-index
+  const raw = String(userAnswer ?? "").trim();
+  const upper = raw.toUpperCase();
+  const alphaMap: Record<string, number> = { A: 0, B: 1, C: 2, D: 3, E: 4 };
+
+  // 유저 입력 → 인덱스로 해석
+  let userPickIndex: number | null = null;
+
+  // 숫자 (1 → 0)
   if (/^\d+$/.test(raw)) {
     const n = Number(raw);
-    if (Number.isInteger(n) && n >= 1 && n <= 9) {
-      return { kind: "index" as const, index: n - 1, raw };
-    }
+    if (Number.isFinite(n) && n >= 1) userPickIndex = n - 1;
   }
 
-  // 알파벳 A=0
-  const code = up.charCodeAt(0);
-  if (up.length === 1 && code >= 65 && code <= 73) {
-    return { kind: "index" as const, index: code - 65, raw };
+  // 알파벳 (A → 0)
+  if (upper in alphaMap) {
+    userPickIndex = alphaMap[upper];
   }
 
-  return { kind: "raw" as const, raw };
+  const userPickValue =
+    userPickIndex !== null && choices[userPickIndex] != null
+      ? String(choices[userPickIndex]).trim()
+      : raw;
+
+  const ansStr = String(correctAnswer ?? "").trim();
+  const ansUpper = ansStr.toUpperCase();
+
+  let isCorrect = false;
+
+  // 1) 정답이 "1" 같은 번호인 경우
+  if (/^\d+$/.test(ansStr) && userPickIndex !== null) {
+    const ansIndex = Number(ansStr) - 1;
+    isCorrect = ansIndex === userPickIndex;
+  }
+  // 2) 정답이 "A" 같은 알파벳인 경우
+  else if (ansStr.length === 1 && ansUpper in alphaMap && userPickIndex !== null) {
+    isCorrect = alphaMap[ansUpper] === userPickIndex;
+  }
+  // 3) 정답이 텍스트(선택지 문장 등)인 경우
+  else {
+    isCorrect =
+      userPickValue.trim().toUpperCase() === ansUpper ||
+      raw.trim().toUpperCase() === ansUpper;
+  }
+
+  return {
+    isCorrect,
+    raw,
+    userPickIndex,
+    userPickValue,
+    ansStr,
+  };
 }
 
 function safeErrorText(e: unknown) {
@@ -126,13 +171,11 @@ function safeErrorText(e: unknown) {
 }
 
 function mustAcceptSseAndJson(req: Request) {
-  // MCP Streamable HTTP는 클라이언트가 둘 다 accept 해야 함
   const accept = String(req.headers["accept"] ?? "");
   return accept.includes("text/event-stream") && accept.includes("application/json");
 }
 
 function safeJsonRpcError(res: Response, message = "Internal Server Error") {
-  // MCP/JSON-RPC 스타일로 최소만 노출
   res.status(500).json({
     jsonrpc: "2.0",
     error: { code: -32000, message },
@@ -140,13 +183,19 @@ function safeJsonRpcError(res: Response, message = "Internal Server Error") {
   });
 }
 
+/* ------------------------ Placement / Diagnosis Config -------------------- */
+
+const PLACEMENT_QUESTION_COUNT = 5;
+
 /* ------------------------------- MCP Server ------------------------------- */
+
 const server = new McpServer({ name: "playlearn-mcp", version: "1.0.0" });
 
-/* ------------------------------ Tool: get_user_state ------------------------------ */
+/* --------------------------- Tool: get_user_state ------------------------- */
+
 server.tool(
   "get_user_state",
-  "유저 상태(레벨/진단완료 여부/마지막 모드)를 조회합니다.",
+  "유저의 레벨/진단 여부/마지막 모드 상태를 조회합니다.",
   { user_id: z.string().min(1) },
   async (args) => {
     try {
@@ -161,41 +210,354 @@ server.tool(
       if (error) throw error;
 
       if (!data) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify({
-                exists: false,
-                placement_done: false,
-                current_level: 3,
-                last_mode: null,
-              }),
-            },
-          ],
+        // 아직 한번도 학습/진단 안 한 유저
+        const payload = {
+          exists: false,
+          user_id,
+          placement_done: false,
+          current_level: 3,
+          last_mode: null as string | null,
         };
+        return { content: [{ type: "text", text: JSON.stringify(payload, null, 2) }] };
       }
 
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify({
-              exists: true,
-              placement_done: Boolean((data as any).placement_done ?? false),
-              current_level: Number((data as any).current_level ?? 3),
-              last_mode: (data as any).last_mode ?? null,
-            }),
-          },
-        ],
+      const u = data as any;
+      const payload = {
+        exists: true,
+        user_id,
+        placement_done: !!u.placement_done,
+        current_level: Number(u.current_level ?? 3),
+        last_mode: u.last_mode ?? null,
       };
+
+      return { content: [{ type: "text", text: JSON.stringify(payload, null, 2) }] };
     } catch (e) {
-      return { content: [{ type: "text", text: safeErrorText(e) }], isError: true };
+      return { content: [{ type: "text", text: `get_user_state 실패: ${safeErrorText(e)}` }], isError: true };
     }
   }
 );
 
-// Tool: get_question
+/* --------------------------- Tool: placement_start ------------------------ */
+
+server.tool(
+  "placement_start",
+  "짧은 진단(기본 5문제) 세션을 만들고 첫 문제를 반환합니다.",
+  { user_id: z.string().min(1), mode: ModeEnum },
+  async (args) => {
+    try {
+      const { user_id, mode } = PlacementStartArgs.parse(args);
+
+      // 유저 없으면 생성 (last_mode = mode)
+      await ensureUser(user_id, mode);
+
+      // 현재 레벨 불러오기 (없으면 3)
+      const { data: u, error: uErr } = await supabase
+        .from("users")
+        .select("current_level")
+        .eq("user_id", user_id)
+        .maybeSingle();
+      if (uErr) throw uErr;
+
+      const startLevel = Number((u as any)?.current_level ?? 3);
+
+      // placement 세션 생성
+      const placement_id = randomUUID();
+      const { error: sErr } = await supabase.from("placement_sessions").insert({
+        placement_id,
+        user_id,
+        mode,
+        is_done: false,
+        asked_count: 0,
+        correct_count: 0,
+        current_level: startLevel,
+        last_q_id: null,
+      });
+      if (sErr) throw sErr;
+
+      // 첫 문제 (시작 레벨 기준)
+      const { data: qs, error: qErr } = await supabase
+        .from("questions")
+        .select("q_id, mode, level, prompt, choices, media")
+        .eq("mode", mode)
+        .eq("level", startLevel)
+        .eq("is_active", true)
+        .order("created_at", { ascending: false })
+        .limit(1);
+
+      if (qErr) throw qErr;
+      if (!qs || qs.length === 0) {
+        return {
+          content: [
+            {
+              type: "text",
+              text:
+                `진단 시작에 실패했습니다. (mode=${mode}, level=${startLevel} 문제 없음)\n` +
+                `questions 테이블에 is_active=true 문제를 추가해 주세요.\n` +
+                `placement_id: ${placement_id}`,
+            },
+          ],
+          isError: true,
+        };
+      }
+
+      const q = qs[0] as any;
+      const choices = (q.choices ?? []) as string[];
+      const mediaMd = q.media?.image ? `\n\n![image](${q.media.image})\n` : "";
+
+      // 세션 상태 업데이트: 첫 문제 출제
+      const { error: upErr } = await supabase
+        .from("placement_sessions")
+        .update({
+          asked_count: 1,
+          last_q_id: q.q_id,
+        })
+        .eq("placement_id", placement_id);
+      if (upErr) throw upErr;
+
+      const text =
+`🧪 진단을 시작합니다. (총 ${PLACEMENT_QUESTION_COUNT}문제)
+- 시작 레벨: Lv.${startLevel}
+- placement_id: \`${placement_id}\`
+
+🧩 **문제 (${q.mode} / Lv.${q.level})**
+${q.prompt}${mediaMd}
+
+${choices.length ? choices.map((c: string, i: number) => `${i + 1}. ${c}`).join("\n") : "(선택지가 없습니다)"}
+
+q_id: \`${q.q_id}\`
+
+답은 "1~5" 또는 "A~E"로 보내도 됩니다.
+난이도 느낌도 같이 주세요: hard / easy / neutral`;
+
+      return { content: [{ type: "text", text }] };
+    } catch (e) {
+      return { content: [{ type: "text", text: `placement_start 실패: ${safeErrorText(e)}` }], isError: true };
+    }
+  }
+);
+
+/* -------------------------- Tool: placement_submit ------------------------ */
+
+server.tool(
+  "placement_submit",
+  "진단 답안을 채점하고 다음 문제 또는 최종 레벨 결과를 반환합니다. (총 5문제)",
+  {
+    user_id: z.string().min(1),
+    placement_id: z.string().uuid(),
+    q_id: z.string().uuid(),
+    user_answer: z.string().min(1),
+    signal: z.enum(["hard", "easy", "neutral"]).optional(),
+  },
+  async (args) => {
+    try {
+      const { user_id, placement_id, q_id, user_answer, signal } =
+        PlacementSubmitArgs.parse(args);
+
+      // 세션 조회
+      const { data: sess, error: sErr } = await supabase
+        .from("placement_sessions")
+        .select("placement_id, user_id, mode, is_done, asked_count, correct_count, current_level")
+        .eq("placement_id", placement_id)
+        .maybeSingle();
+      if (sErr) throw sErr;
+      if (!sess) {
+        return { content: [{ type: "text", text: "placement_id 세션을 찾지 못했습니다." }], isError: true };
+      }
+
+      const S = sess as any;
+
+      if (S.user_id !== user_id) {
+        return { content: [{ type: "text", text: "이 placement_id는 해당 user_id의 세션이 아닙니다." }], isError: true };
+      }
+      if (S.is_done) {
+        return { content: [{ type: "text", text: "이미 종료된 진단 세션입니다." }], isError: true };
+      }
+
+      // 유저 보장 (last_mode = 세션 모드)
+      await ensureUser(user_id, S.mode as Mode);
+
+      // 문제 조회
+      const { data: q, error: qErr } = await supabase
+        .from("questions")
+        .select("q_id, mode, level, prompt, choices, answer, explanation, media")
+        .eq("q_id", q_id)
+        .maybeSingle();
+      if (qErr) throw qErr;
+      if (!q) {
+        return { content: [{ type: "text", text: "해당 q_id 문제를 찾지 못했습니다." }], isError: true };
+      }
+
+      const Q = q as any;
+      const choices = (Q.choices ?? []) as string[];
+
+      // 채점
+      const graded = gradeAnswer({
+        choices,
+        correctAnswer: Q.answer,
+        userAnswer: user_answer,
+      });
+
+      const prevAsked = Number(S.asked_count ?? 0);
+      const prevCorrect = Number(S.correct_count ?? 0);
+      const currentLevel = Number(S.current_level ?? 3);
+
+      const nextAsked = prevAsked + 1;
+      const nextCorrect = prevCorrect + (graded.isCorrect ? 1 : 0);
+
+      // 간단한 레벨 조정 규칙: 맞으면 +1, 틀리면 유지
+      const nextLevel = graded.isCorrect ? Math.min(currentLevel + 1, 10) : currentLevel;
+
+      // 로그 기록 (placement_attempt)
+      const { error: logErr } = await supabase.from("study_logs").insert({
+        user_id,
+        event_type: "placement_attempt",
+        ref_id: String(Q.q_id),
+        mode: S.mode,
+        level: Q.level,
+        is_correct: graded.isCorrect,
+        signal: signal ?? "neutral",
+      });
+      if (logErr) throw logErr;
+
+      const isFinish = nextAsked >= PLACEMENT_QUESTION_COUNT;
+
+      if (isFinish) {
+        const finalLevel = nextLevel;
+
+        const { error: finErr } = await supabase
+          .from("placement_sessions")
+          .update({
+            is_done: true,
+            finished_at: new Date().toISOString(),
+            asked_count: nextAsked,
+            correct_count: nextCorrect,
+            current_level: finalLevel,
+            last_q_id: Q.q_id,
+          })
+          .eq("placement_id", placement_id);
+        if (finErr) throw finErr;
+
+        const { error: uUpErr } = await supabase
+          .from("users")
+          .update({
+            current_level: finalLevel,
+            placement_done: true,
+            last_mode: S.mode ?? "toeic",
+          })
+          .eq("user_id", user_id);
+        if (uUpErr) throw uUpErr;
+
+        const text =
+`✅ 진단 완료!
+- 정답 개수: ${nextCorrect} / ${PLACEMENT_QUESTION_COUNT}
+- 최종 레벨: **Lv.${finalLevel}**
+
+이제부터는 "${S.mode}" 모드에서 Lv.${finalLevel} 문제로 학습을 진행하면 됩니다.`;
+
+        return { content: [{ type: "text", text }] };
+      }
+
+      // 다음 문제 뽑기 (nextLevel 기준)
+      const { data: nextQs, error: nqErr } = await supabase
+        .from("questions")
+        .select("q_id, mode, level, prompt, choices, media")
+        .eq("mode", S.mode)
+        .eq("level", nextLevel)
+        .eq("is_active", true)
+        .order("created_at", { ascending: false })
+        .limit(1);
+      if (nqErr) throw nqErr;
+
+      if (!nextQs || nextQs.length === 0) {
+        // 다음 문제가 없으면 여기서 종료 처리
+        const finalLevel = nextLevel;
+
+        await supabase
+          .from("placement_sessions")
+          .update({
+            is_done: true,
+            finished_at: new Date().toISOString(),
+            asked_count: nextAsked,
+            correct_count: nextCorrect,
+            current_level: finalLevel,
+            last_q_id: Q.q_id,
+          })
+          .eq("placement_id", placement_id);
+
+        await supabase
+          .from("users")
+          .update({
+            current_level: finalLevel,
+            placement_done: true,
+            last_mode: S.mode ?? "toeic",
+          })
+          .eq("user_id", user_id);
+
+        const text =
+`진단은 진행되었지만, 다음 레벨의 문제가 없어 여기서 종료합니다.
+- 최종 레벨: Lv.${finalLevel}
+(questions 테이블에 is_active=true 문제를 더 추가해 주세요.)`;
+
+        return { content: [{ type: "text", text }] };
+      }
+
+      const NQ = nextQs[0] as any;
+      const nChoices = (NQ.choices ?? []) as string[];
+      const mediaMd = NQ.media?.image ? `\n\n![image](${NQ.media.image})\n` : "";
+
+      // 세션 업데이트
+      const { error: upErr } = await supabase
+        .from("placement_sessions")
+        .update({
+          asked_count: nextAsked,
+          correct_count: nextCorrect,
+          current_level: nextLevel,
+          last_q_id: NQ.q_id,
+        })
+        .eq("placement_id", placement_id);
+      if (upErr) throw upErr;
+
+      const pickedDesc =
+        graded.userPickIndex !== null
+          ? `${graded.userPickIndex + 1}번${
+              choices[graded.userPickIndex]
+                ? ` (${choices[graded.userPickIndex]})`
+                : ""
+            }`
+          : graded.raw;
+
+      const header =
+`${graded.isCorrect ? "✅ 정답" : "❌ 오답"}
+- 내가 보낸 답: ${graded.raw}
+- 해석된 선택: ${pickedDesc}
+- 정답(저장값): ${graded.ansStr}
+- 해설: ${Q.explanation ?? "(해설 없음)"}
+- 난이도 신호: ${signal ?? "neutral"}
+
+🧪 진단 진행 상황: ${nextAsked} / ${PLACEMENT_QUESTION_COUNT}
+- 현재 추정 레벨: Lv.${nextLevel}
+- placement_id: \`${placement_id}\``;
+
+      const nextText =
+`🧩 **다음 문제 (${NQ.mode} / Lv.${NQ.level})**
+${NQ.prompt}${mediaMd}
+
+${nChoices.length ? nChoices.map((c: string, i: number) => `${i + 1}. ${c}`).join("\n") : "(선택지가 없습니다)"}
+
+q_id: \`${NQ.q_id}\`
+
+답은 "1~5" 또는 "A~E"로 보내도 됩니다.
+난이도 느낌: hard / easy / neutral`;
+
+      return { content: [{ type: "text", text: `${header}\n\n${nextText}` }] };
+    } catch (e) {
+      return { content: [{ type: "text", text: `placement_submit 실패: ${safeErrorText(e)}` }], isError: true };
+    }
+  }
+);
+
+/* ----------------------------- Tool: get_question ------------------------- */
+
 server.tool(
   "get_question",
   "모드/레벨에 맞는 활성(is_active=true) 객관식 문제 1개를 가져옵니다.",
@@ -235,95 +597,87 @@ q_id: \`${q.q_id}\`
   }
 );
 
-// Tool: submit_answer
+/* ----------------------------- Tool: submit_answer ------------------------ */
+
 server.tool(
   "submit_answer",
   "정답 체크 + study_logs 저장 + 사용자의 신호(hard/easy/neutral) 기록",
   {
     user_id: z.string(),
-    q_id: z.string(),
+    q_id: z.string().uuid(),
     user_answer: z.string(),
     signal: z.enum(["hard", "easy", "neutral"]).optional(),
   },
   async (args) => {
     try {
       const { user_id, q_id, user_answer, signal } = SubmitAnswerArgs.parse(args);
-      await ensureUser(user_id);
 
-      // ✅ choices까지 같이 가져와서 1/A 같은 입력도 처리 가능하게
+      // 문제 + choices + 정답 조회
       const { data: q, error: qErr } = await supabase
         .from("questions")
         .select("q_id, mode, level, answer, explanation, choices")
         .eq("q_id", q_id)
         .maybeSingle();
-
       if (qErr) throw qErr;
       if (!q) {
         return { content: [{ type: "text", text: "해당 q_id 문제를 찾지 못했습니다." }], isError: true };
       }
 
-      const choices = (q as any).choices ? ((q as any).choices as string[]) : [];
+      const Q = q as any;
+      const choices = (Q.choices ?? []) as string[];
 
-      const uParsed = normalizeChoiceAnswer(user_answer);
-      const ansRaw = String((q as any).answer ?? "").trim();
-      const aParsed = normalizeChoiceAnswer(ansRaw);
+      // 유저 보장 (last_mode = 문제 모드)
+      await ensureUser(user_id, Q.mode as Mode);
 
-      // user가 인덱스로 들어왔으면, 선택지 텍스트도 만들어둠
-      const userPickValue =
-        uParsed.kind === "index" && choices[uParsed.index] != null
-          ? String(choices[uParsed.index]).trim()
-          : uParsed.raw;
+      // 채점 (1/A/텍스트 모두 허용)
+      const graded = gradeAnswer({
+        choices,
+        correctAnswer: Q.answer,
+        userAnswer: user_answer,
+      });
 
-      let isCorrect = false;
-
-      // 1) answer가 숫자/알파로 들어온 경우 -> index 비교
-      if (uParsed.kind === "index" && aParsed.kind === "index") {
-        isCorrect = uParsed.index === aParsed.index;
-      }
-      // 2) answer가 텍스트(선택지 문장)인 경우 -> 텍스트 비교
-      else {
-        isCorrect =
-          userPickValue.trim().toUpperCase() === ansRaw.toUpperCase() ||
-          uParsed.raw.trim().toUpperCase() === ansRaw.toUpperCase();
-      }
-
+      // 로그 저장
       const { error: logErr } = await supabase.from("study_logs").insert({
         user_id,
         event_type: "quiz_attempt",
-        ref_id: String((q as any).q_id),
-        mode: (q as any).mode,
-        level: (q as any).level,
-        is_correct: isCorrect,
+        ref_id: String(Q.q_id),
+        mode: Q.mode,
+        level: Q.level,
+        is_correct: graded.isCorrect,
         signal: signal ?? "neutral",
       });
-
       if (logErr) throw logErr;
 
-      const dbgPicked =
-        uParsed.kind === "index"
-          ? `${uParsed.index + 1}번${choices[uParsed.index] ? ` (${choices[uParsed.index]})` : ""}`
-          : uParsed.raw;
+      const pickedDesc =
+        graded.userPickIndex !== null
+          ? `${graded.userPickIndex + 1}번${
+              choices[graded.userPickIndex]
+                ? ` (${choices[graded.userPickIndex]})`
+                : ""
+            }`
+          : graded.raw;
 
       const text =
-`${isCorrect ? "✅ 정답" : "❌ 오답"}
+`${graded.isCorrect ? "✅ 정답" : "❌ 오답"}
 
-- 내가 보낸 답: ${String(user_answer).trim()}
-- 해석된 선택: ${dbgPicked}
-- 정답(저장값): ${ansRaw}
-- 해설: ${(q as any).explanation ?? "(해설 없음)"}
+- 내가 보낸 답: ${graded.raw}
+- 해석된 선택: ${pickedDesc}
+- 정답(저장값): ${graded.ansStr}
+- 해설: ${Q.explanation ?? "(해설 없음)"}
 - 신호: ${signal ?? "neutral"}`;
 
       return { content: [{ type: "text", text }] };
-    } catch (err) {
+    } catch (e) {
       return {
-        content: [{ type: "text", text: `submit_answer 실패: ${safeErrorText(err)}` }],
+        content: [{ type: "text", text: `submit_answer 실패: ${safeErrorText(e)}` }],
         isError: true,
       };
     }
   }
 );
 
-// Tool: save_item
+/* ------------------------------- Tool: save_item -------------------------- */
+
 server.tool(
   "save_item",
   "단어/오답/메모를 review_items에 저장합니다.",
@@ -335,7 +689,10 @@ server.tool(
   },
   async (args) => {
     const { user_id, item_type, key, payload } = SaveItemArgs.parse(args);
-    await ensureUser(user_id);
+
+    // 단어면 last_mode를 toeic으로 잡는 게 자연스러우니 기본값 toeic 사용
+    const defaultMode: Mode = item_type === "vocab" ? "toeic" : "grammar";
+    await ensureUser(user_id, defaultMode);
 
     const { error } = await supabase.from("review_items").insert({
       item_id: randomUUID(),
@@ -354,7 +711,8 @@ server.tool(
   }
 );
 
-// Tool: get_review_items
+/* ---------------------------- Tool: get_review_items ---------------------- */
+
 server.tool(
   "get_review_items",
   "복습할 아이템(오래 안 본 것 우선)을 가져옵니다.",
@@ -365,6 +723,7 @@ server.tool(
   },
   async (args) => {
     const parsed = GetReviewItemsArgs.parse(args);
+    // 단순 조회지만, 유저가 없다면 기본 생성
     await ensureUser(parsed.user_id);
 
     let query = supabase
@@ -372,32 +731,45 @@ server.tool(
       .select("item_id, item_type, key, payload, strength, last_seen_at, created_at")
       .eq("user_id", parsed.user_id);
 
-    if (parsed.item_type) query = query.eq("item_type", parsed.item_type);
+    if (parsed.item_type) {
+      query = query.eq("item_type", parsed.item_type);
+    }
 
-    const { data, error } = await query.order("last_seen_at", { ascending: true }).limit(parsed.limit);
+    const { data, error } = await query
+      .order("last_seen_at", { ascending: true })
+      .limit(parsed.limit);
 
     if (error) throw error;
 
     const text =
-`📌 복습 아이템 (${data?.length ?? 0}개)` +
-(data && data.length
-  ? "\n" +
-    data
-      .map((it: any, idx: number) => `${idx + 1}) [${it.item_type}] **${it.key}**\n- payload: ${JSON.stringify(it.payload)}`)
-      .join("\n")
-  : "\n(없음)");
+      `📌 복습 아이템 (${data?.length ?? 0}개)` +
+      (data && data.length
+        ? "\n" +
+          data
+            .map(
+              (it: any, idx: number) =>
+                `${idx + 1}) [${it.item_type}] **${it.key}**\n- payload: ${JSON.stringify(
+                  it.payload
+                )}`
+            )
+            .join("\n")
+        : "\n(없음)");
 
     return { content: [{ type: "text", text }] };
   }
 );
 
-// Tool: get_learning_summary
+/* -------------------------- Tool: get_learning_summary -------------------- */
+
 server.tool(
   "get_learning_summary",
   "기간(최근 N일) 기반 학습 요약을 제공합니다.",
   { user_id: z.string(), days: z.number().int().min(1).max(365).optional() },
   async (args) => {
-    const { user_id, days } = GetLearningSummaryArgs.parse(args);
+    const parsed = GetLearningSummaryArgs.parse(args);
+    const user_id = parsed.user_id;
+    const days = parsed.days ?? 7;
+
     await ensureUser(user_id);
 
     const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
@@ -408,7 +780,6 @@ server.tool(
       .eq("user_id", user_id)
       .eq("event_type", "quiz_attempt")
       .gte("created_at", since);
-
     if (aErr) throw aErr;
 
     const total = attempts?.length ?? 0;
@@ -419,7 +790,6 @@ server.tool(
       .select("item_type, created_at")
       .eq("user_id", user_id)
       .gte("created_at", since);
-
     if (sErr) throw sErr;
 
     const savedTotal = saved?.length ?? 0;
@@ -435,238 +805,21 @@ server.tool(
   }
 );
 
-/* --------------------------- Tool: placement_start -------------------------- */
-server.tool(
-  "placement_start",
-  "짧은 진단(기본 5문제) 세션을 만들고 첫 문제를 반환합니다.",
-  { user_id: z.string().min(1), mode: ModeEnum },
-  async (args) => {
-    try {
-      const { user_id, mode } = PlacementStartArgs.parse(args);
-      await ensureUser(user_id);
-
-      const { data: u, error: uErr } = await supabase
-        .from("users")
-        .select("current_level")
-        .eq("user_id", user_id)
-        .maybeSingle();
-      if (uErr) throw uErr;
-
-      const startLevel = Number((u as any)?.current_level ?? 3);
-      const placement_id = randomUUID();
-
-      const { error: sErr } = await supabase.from("placement_sessions").insert({
-        placement_id,
-        user_id,
-        mode,
-        asked_count: 0,
-        correct_count: 0,
-        current_level: startLevel,
-        is_done: false,
-      });
-      if (sErr) throw sErr;
-
-      const { data: qs, error: qErr } = await supabase
-        .from("questions")
-        .select("q_id, mode, level, prompt, choices, media")
-        .eq("mode", mode)
-        .eq("level", startLevel)
-        .eq("is_active", true)
-        .order("created_at", { ascending: false })
-        .limit(1);
-
-      if (qErr) throw qErr;
-      if (!qs || qs.length === 0) {
-        return { content: [{ type: "text", text: "진단 시작 실패: 해당 레벨 문제 없음" }], isError: true };
-      }
-
-      const q = qs[0] as any;
-      const choices = (q.choices ?? []) as string[];
-      const mediaMd = q.media?.image ? `\n\n![image](${q.media.image})\n` : "";
-
-      await supabase
-        .from("placement_sessions")
-        .update({ last_q_id: q.q_id })
-        .eq("placement_id", placement_id);
-
-      const text =
-`🧪 진단 시작 (placement_id: \`${placement_id}\`)
-현재 레벨 추정: Lv.${startLevel}
-
-🧩 문제 (${q.mode} / Lv.${q.level})
-${q.prompt}${mediaMd}
-
-${choices.length ? choices.map((c: string, i: number) => `${i + 1}. ${c}`).join("\n") : "(선택지가 없습니다)"}
-
-q_id: \`${q.q_id}\`
-
-답은 **1~4** 또는 **A/B/C/D**로 보내도 됩니다.`;
-
-      return { content: [{ type: "text", text }] };
-    } catch (e) {
-      return { content: [{ type: "text", text: `placement_start 실패: ${safeErrorText(e)}` }], isError: true };
-    }
-  }
-);
-
-/* --------------------------- Tool: placement_submit -------------------------- */
-server.tool(
-  "placement_submit",
-  "진단 답안을 채점하고 다음 문제 또는 최종 레벨 결과를 반환합니다. (총 5문제)",
-  {
-    user_id: z.string().min(1),
-    placement_id: z.string().uuid(),
-    q_id: z.string().uuid(),
-    user_answer: z.string().min(1),
-    signal: z.enum(["hard", "easy", "neutral"]).optional(),
-  },
-  async (args) => {
-    try {
-      const { user_id, placement_id, q_id, user_answer } = PlacementSubmitArgs.parse(args);
-      await ensureUser(user_id);
-
-      const { data: s, error: sErr } = await supabase
-        .from("placement_sessions")
-        .select("*")
-        .eq("placement_id", placement_id)
-        .maybeSingle();
-      if (sErr) throw sErr;
-      if (!s) return { content: [{ type: "text", text: "placement_id 세션 없음" }], isError: true };
-      if ((s as any).is_done) return { content: [{ type: "text", text: "이미 완료된 진단입니다." }], isError: true };
-
-      const { data: q, error: qErr } = await supabase
-        .from("questions")
-        .select("q_id, mode, level, answer, explanation, choices, prompt, media")
-        .eq("q_id", q_id)
-        .maybeSingle();
-      if (qErr) throw qErr;
-      if (!q) return { content: [{ type: "text", text: "문제(q_id) 없음" }], isError: true };
-
-      const choices = (q as any).choices ? ((q as any).choices as string[]) : [];
-
-      const uParsed = normalizeChoiceAnswer(user_answer);
-      const ansRaw = String((q as any).answer ?? "").trim();
-      const aParsed = normalizeChoiceAnswer(ansRaw);
-
-      const userPickValue =
-        uParsed.kind === "index" && choices[uParsed.index] != null
-          ? String(choices[uParsed.index]).trim()
-          : uParsed.raw;
-
-      let isCorrect = false;
-      if (uParsed.kind === "index" && aParsed.kind === "index") {
-        isCorrect = uParsed.index === aParsed.index;
-      } else {
-        isCorrect =
-          userPickValue.trim().toUpperCase() === ansRaw.toUpperCase() ||
-          uParsed.raw.trim().toUpperCase() === ansRaw.toUpperCase();
-      }
-
-      const asked = Number((s as any).asked_count ?? 0) + 1;
-      const correct = Number((s as any).correct_count ?? 0) + (isCorrect ? 1 : 0);
-
-      // 레벨 업데이트 규칙(간단 버전)
-      let level = Number((s as any).current_level ?? 3);
-      if (isCorrect) level = Math.min(10, level + 1);
-
-      const done = asked >= 5;
-
-      const { error: upErr } = await supabase
-        .from("placement_sessions")
-        .update({
-          asked_count: asked,
-          correct_count: correct,
-          current_level: level,
-          last_q_id: q_id,
-          finished_at: done ? new Date().toISOString() : null,
-          is_done: done,
-        })
-        .eq("placement_id", placement_id);
-      if (upErr) throw upErr;
-
-      if (done) {
-        const { error: uUpErr } = await supabase
-          .from("users")
-          .update({
-            current_level: level,
-            placement_done: true,
-            last_mode: (s as any).mode ?? (q as any).mode ?? null,
-          })
-          .eq("user_id", user_id);
-        if (uUpErr) throw uUpErr;
-
-        return {
-          content: [
-            {
-              type: "text",
-              text:
-`✅ 진단 완료!
-- 정답: ${correct}/5
-- 최종 레벨: Lv.${level}
-
-이제부터는 이 레벨 기준으로 문제를 드릴게요.`,
-            },
-          ],
-        };
-      }
-
-      // 다음 문제(업데이트된 레벨 기준)
-      const mode = (s as any).mode;
-      const { data: nexts, error: nErr } = await supabase
-        .from("questions")
-        .select("q_id, mode, level, prompt, choices, media")
-        .eq("mode", mode)
-        .eq("level", level)
-        .eq("is_active", true)
-        .order("created_at", { ascending: false })
-        .limit(1);
-
-      if (nErr) throw nErr;
-      if (!nexts || nexts.length === 0) {
-        return { content: [{ type: "text", text: "다음 문제를 찾지 못했습니다." }], isError: true };
-      }
-
-      const nq = nexts[0] as any;
-      const nChoices = (nq.choices ?? []) as string[];
-      const mediaMd = nq.media?.image ? `\n\n![image](${nq.media.image})\n` : "";
-
-      const text =
-`${isCorrect ? "✅ 정답" : "❌ 오답"}
-(현재 레벨 추정 → Lv.${level})
-
-🧩 다음 문제 (${nq.mode} / Lv.${nq.level})
-${nq.prompt}${mediaMd}
-
-${nChoices.length ? nChoices.map((c: string, i: number) => `${i + 1}. ${c}`).join("\n") : "(선택지가 없습니다)"}
-
-q_id: \`${nq.q_id}\`
-
-답은 **1~4** 또는 **A/B/C/D**로 보내도 됩니다.`;
-
-      return { content: [{ type: "text", text }] };
-    } catch (e) {
-      return { content: [{ type: "text", text: `placement_submit 실패: ${safeErrorText(e)}` }], isError: true };
-    }
-  }
-);
-
 /* ------------------------------- Express App ------------------------------ */
+
 const app = express();
 
-// JSON 파싱 (MCP POST body용)
 app.use(express.json({ limit: "1mb" }));
 
-// 단순 헬스체크 (Render에서 timeout 방지/확인용)
 app.get("/", (_req, res) => res.status(200).send("ok"));
 app.get("/health", (_req, res) => res.status(200).json({ ok: true }));
 
 /* -------------------------- Session / Transport Store --------------------- */
-// 주의: Render Free는 인스턴스가 자주 sleep/재시작 → 메모리 세션은 사라질 수 있음(정상)
+
 const transports: Record<string, StreamableHTTPServerTransport> = {};
 const sessionsLastSeen: Record<string, number> = {};
 const SESSION_TTL_MS = 1000 * 60 * 30; // 30분
 
-// 5분마다 오래된 세션 정리
 setInterval(() => {
   const now = Date.now();
   for (const [sid, last] of Object.entries(sessionsLastSeen)) {
@@ -677,16 +830,17 @@ setInterval(() => {
   }
 }, 1000 * 60 * 5);
 
-/* ---------------------------------- MCP ---------------------------------- */
+/* ---------------------------------- MCP HTTP ------------------------------ */
+
 app.post("/mcp", async (req: Request, res: Response) => {
   try {
-    // MCP는 Accept 헤더 필수
     if (!mustAcceptSseAndJson(req)) {
       res.status(406).json({
         jsonrpc: "2.0",
         error: {
           code: -32000,
-          message: "Not Acceptable: Client must accept both application/json and text/event-stream",
+          message:
+            "Not Acceptable: Client must accept both application/json and text/event-stream",
         },
         id: null,
       });
@@ -708,7 +862,6 @@ app.post("/mcp", async (req: Request, res: Response) => {
 
       await server.connect(transport);
 
-      // 클라이언트에게 세션 id 전달
       res.setHeader("mcp-session-id", newSessionId);
     } else {
       sessionsLastSeen[incomingSessionId] = Date.now();
@@ -728,7 +881,8 @@ app.get("/mcp", async (req: Request, res: Response) => {
         jsonrpc: "2.0",
         error: {
           code: -32000,
-          message: "Not Acceptable: Client must accept both application/json and text/event-stream",
+          message:
+            "Not Acceptable: Client must accept both application/json and text/event-stream",
         },
         id: null,
       });
@@ -757,6 +911,7 @@ app.get("/mcp", async (req: Request, res: Response) => {
 });
 
 /* --------------------------------- Listen -------------------------------- */
+
 const PORT = Number(process.env.PORT || 3000);
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`✅ MCP HTTP Server running: http://0.0.0.0:${PORT}/mcp`);
