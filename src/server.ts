@@ -1,4 +1,3 @@
-// src/server.ts
 import "dotenv/config";
 import express, { type Request, type Response } from "express";
 import { randomUUID } from "crypto";
@@ -121,13 +120,13 @@ function gradeAnswer(opts: {
 
   let userPickIndex: number | null = null;
 
-  // 숫자(1,2,3,...) 입력
+  // 숫자(1,2,3,4..)
   if (/^\d+$/.test(raw)) {
     const n = Number(raw);
     if (Number.isFinite(n) && n >= 1) userPickIndex = n - 1;
   }
 
-  // 알파벳(A,B,...) 입력
+  // 알파벳(A,B,C,D..)
   if (upper in alphaMap) userPickIndex = alphaMap[upper];
 
   const userPickValue =
@@ -138,18 +137,30 @@ function gradeAnswer(opts: {
   const ansStr = String(opts.correctAnswer ?? "").trim();
   const ansUpper = ansStr.toUpperCase();
 
-  // 정답이 "1","2" 같은 번호 형태일 때
+  // 정답이 "1","2"처럼 숫자 인덱스인 경우
   if (/^\d+$/.test(ansStr) && userPickIndex !== null) {
     const ansIndex = Number(ansStr) - 1;
-    return { isCorrect: ansIndex === userPickIndex, raw, userPickIndex, userPickValue, ansStr };
+    return {
+      isCorrect: ansIndex === userPickIndex,
+      raw,
+      userPickIndex,
+      userPickValue,
+      ansStr,
+    };
   }
 
-  // 정답이 "A","B" 같은 알파벳 형태일 때
+  // 정답이 "A","B"처럼 알파벳인 경우
   if (ansStr.length === 1 && ansUpper in alphaMap && userPickIndex !== null) {
-    return { isCorrect: alphaMap[ansUpper] === userPickIndex, raw, userPickIndex, userPickValue, ansStr };
+    return {
+      isCorrect: alphaMap[ansUpper] === userPickIndex,
+      raw,
+      userPickIndex,
+      userPickValue,
+      ansStr,
+    };
   }
 
-  // 그 외: 텍스트 그대로 비교
+  // 그 외에는 텍스트 비교
   const isCorrect =
     userPickValue.trim().toUpperCase() === ansUpper ||
     raw.trim().toUpperCase() === ansUpper;
@@ -243,7 +254,7 @@ server.tool(
   "placement_submit",
   "진단 답안을 채점하고 다음 문제 또는 최종 레벨 결과를 반환합니다. (총 5문제)",
   {
-    user_id: z.string().optional(),
+    user_id: z.string().min(1).optional(), // ✅ 카카오가 안 보내도 됨
     placement_id: z.string().uuid(),
     q_id: z.string().uuid(),
     user_answer: z.string().min(1),
@@ -257,36 +268,10 @@ server.tool(
 
       await ensureUser(user_id, "toeic");
 
-      // 세션 확인
-      const { data: s, error: sErr } = await supabase
-        .from("placement_sessions")
-        .select("*")
-        .eq("placement_id", placement_id)
-        .maybeSingle();
-      if (sErr) throw sErr;
-      if (!s) {
-        return {
-          content: [
-            { type: "text", text: "placement_id 세션을 찾지 못했습니다." },
-          ],
-          isError: true,
-        };
-      }
-      if ((s as any).is_done) {
-        return {
-          content: [
-            { type: "text", text: "이미 완료된 진단입니다." },
-          ],
-          isError: true,
-        };
-      }
-
-      // 문제 조회
+      // 1) 문제 조회 (먼저)
       const { data: q, error: qErr } = await supabase
         .from("questions")
-        .select(
-          "q_id, mode, level, answer, explanation, choices, prompt, media"
-        )
+        .select("q_id, mode, level, answer, explanation, choices, prompt, media")
         .eq("q_id", q_id)
         .maybeSingle();
       if (qErr) throw qErr;
@@ -299,38 +284,83 @@ server.tool(
 
       const Q = q as any;
       const choices = (Q.choices ?? []) as string[];
+      const mode = (Q.mode ?? "toeic") as Mode;
+      let level = Number(Q.level ?? 3);
 
-      // 채점 (공통 로직 재사용)
+      // 2) 세션 조회 (없으면 여기서 새로 생성 → 카카오가 placement_start 안 써도 동작)
+      const { data: sRow, error: sErr } = await supabase
+        .from("placement_sessions")
+        .select("*")
+        .eq("placement_id", placement_id)
+        .maybeSingle();
+      if (sErr) throw sErr;
+
+      let session: any = sRow ?? null;
+
+      if (!session) {
+        const newSession: any = {
+          placement_id,
+          user_id,
+          mode,
+          asked_count: 0,
+          correct_count: 0,
+          current_level: level,
+          last_q_id: Q.q_id,
+          is_done: false,
+          created_at: new Date().toISOString(),
+          started_at: new Date().toISOString(),
+        };
+        const { error: insErr } = await supabase
+          .from("placement_sessions")
+          .insert(newSession);
+        if (insErr) throw insErr;
+        session = newSession;
+      }
+
+      if (session.is_done) {
+        return {
+          content: [
+            { type: "text", text: "이미 완료된 진단입니다. 다시 시작하려면 '테스트 다시'라고 말씀해 주세요." },
+          ],
+          isError: true,
+        };
+      }
+
+      // 3) 채점
       const graded = gradeAnswer({
         choices,
         correctAnswer: Q.answer,
         userAnswer: user_answer,
       });
 
-      const asked = Number((s as any).asked_count ?? 0) + 1;
+      const asked = Number(session.asked_count ?? 0) + 1;
       const correct =
-        Number((s as any).correct_count ?? 0) + (graded.isCorrect ? 1 : 0);
+        Number(session.correct_count ?? 0) + (graded.isCorrect ? 1 : 0);
 
-      // 레벨 업데이트 규칙(간단)
-      let level = Number((s as any).current_level ?? 3);
-      if (graded.isCorrect) level = Math.min(10, level + 1);
+      level = Number(session.current_level ?? level);
+      if (graded.isCorrect) {
+        level = Math.min(10, level + 1);
+      } else if (signal === "hard") {
+        // 사용자가 "어려워요" 같은 신호를 보냈다고 가정하면 한 단계 내려줘도 됨 (선택)
+        level = Math.max(1, level - 1);
+      }
 
       const done = asked >= PLACEMENT_QUESTION_COUNT;
 
-      // ✅ 로그 저장: q_id 포함해서 NOT NULL 해결
+      // 4) 로그 저장 (q_id/ event_type / ref_id 다 채움 → NOT NULL 방지)
       const { error: logErr } = await supabase.from("study_logs").insert({
         user_id,
         q_id: Q.q_id,
         event_type: "placement_attempt",
         ref_id: String(Q.q_id),
-        mode: (s as any).mode,
+        mode,
         level: Q.level,
         is_correct: graded.isCorrect,
         signal: signal ?? "neutral",
       });
       if (logErr) throw logErr;
 
-      // 세션 업데이트
+      // 5) 세션 업데이트
       const { error: upErr } = await supabase
         .from("placement_sessions")
         .update({
@@ -344,39 +374,31 @@ server.tool(
         .eq("placement_id", placement_id);
       if (upErr) throw upErr;
 
-      // 진단 종료
+      // 6) 진단 종료
       if (done) {
         const { error: uUpErr } = await supabase
           .from("users")
           .update({
             current_level: level,
             placement_done: true,
-            last_mode: (s as any).mode ?? Q.mode ?? null,
+            last_mode: mode,
           })
           .eq("user_id", user_id);
         if (uUpErr) throw uUpErr;
 
-        const text = `✅ 진단 완료!
-- 정답: ${correct}/${PLACEMENT_QUESTION_COUNT}
+        const text = `✅ 레벨 진단이 끝났어요!
+
+- 맞힌 문제: ${correct}/${asked}
 - 최종 레벨: Lv.${level}
 
-이제부터는 이 레벨을 기준으로 문제를 제공할게요.`;
+이제 이 레벨을 기준으로 토익 문제를 내 드릴게요.
+"계속"이라고 보내면 바로 다음 문제부터 풀 수 있어요.`;
         return { content: [{ type: "text", text }] };
       }
 
-      // 다음 문제
-      const mode = (s as any).mode;
-      const { data: nexts, error: nErr } = await supabase
-        .from("questions")
-        .select("q_id, mode, level, prompt, choices, media")
-        .eq("mode", mode)
-        .eq("level", level)
-        .eq("is_active", true)
-        .order("created_at", { ascending: false })
-        .limit(1);
-
-      if (nErr) throw nErr;
-      if (!nexts || nexts.length === 0) {
+      // 7) 다음 문제 (랜덤)
+      const nextQ = await pickRandomQuestion(mode, level);
+      if (!nextQ) {
         return {
           content: [
             {
@@ -389,20 +411,21 @@ server.tool(
         };
       }
 
-      const nq = nexts[0] as any;
-      const nChoices = (nq.choices ?? []) as string[];
-      const mediaMd = nq.media?.image ? `\n\n![image](${nq.media.image})\n` : "";
+      const nChoices = (nextQ.choices ?? []) as string[];
+      const mediaMd = nextQ.media?.image
+        ? `\n\n![image](${nextQ.media.image})\n`
+        : "";
 
-      const header = `${graded.isCorrect ? "✅ 정답" : "❌ 오답"}
+      const feedback = `${graded.isCorrect ? "✅ 정답이에요!" : "❌ 아쉽지만 오답이에요."}
 - 내가 보낸 답: ${graded.raw}
 - 정답(저장값): ${graded.ansStr}
-- 해설: ${Q.explanation ?? "(해설 없음)"}
-(현재 추정 레벨 → Lv.${level})
+- 해설: ${Q.explanation ?? "(해설 없음)"} 
 
-문제가 너무 쉽거나 너무 어렵게 느껴지면, "쉬워요" 또는 "어려워요"라고 말씀해 주세요. 다음 문제 난이도를 조정할 때 참고하겠습니다.`;
+현재 임시 레벨: Lv.${level}
+`;
 
-      const nextText = `🧩 다음 문제 (${nq.mode} / Lv.${nq.level})
-${nq.prompt}${mediaMd}
+      const nextText = `🧩 다음 문제 (${nextQ.mode} / Lv.${nextQ.level})
+${nextQ.prompt}${mediaMd}
 
 ${
   nChoices.length
@@ -410,12 +433,12 @@ ${
     : "(선택지가 없습니다)"
 }
 
-q_id: \`${nq.q_id}\`
+q_id: \`${nextQ.q_id}\`
 
 정답은 **1번** 또는 **A**처럼 숫자 하나 또는 알파벳 하나로 보내 주세요.`;
 
       return {
-        content: [{ type: "text", text: `${header}\n\n${nextText}` }],
+        content: [{ type: "text", text: `${feedback}\n\n${nextText}` }],
       };
     } catch (e) {
       return {
@@ -431,7 +454,7 @@ q_id: \`${nq.q_id}\`
   }
 );
 
-// Tool: get_question
+/* ------------------------------ Tool: get_question ------------------------------ */
 server.tool(
   "get_question",
   "모드/레벨에 맞는 활성(is_active=true) 객관식 문제 1개를 가져옵니다.",
@@ -486,9 +509,9 @@ server.tool(
   "submit_answer",
   "정답 체크 + study_logs 저장",
   {
-    user_id: z.string().optional(),
+    user_id: z.string().optional(), // ✅ optional
     q_id: z.string().uuid(),
-    user_answer: z.string().min(1),
+    user_answer: z.string(),
     signal: z.enum(["hard", "easy", "neutral"]).optional(),
   },
   async (args) => {
@@ -497,7 +520,7 @@ server.tool(
       const user_id = resolveUserId(parsed.user_id);
       const { q_id, user_answer, signal } = parsed;
 
-      await ensureUser(user_id, "toeic"); // 모르는 경우 기본 모드는 toeic으로
+      await ensureUser(user_id, "toeic"); // 기본 모드 toeic
 
       // 문제 조회
       const { data: q, error: qErr } = await supabase
@@ -516,43 +539,47 @@ server.tool(
         };
       }
 
-      const Q = q as any;
-      const choices = (Q.choices ?? []) as string[];
+      const QQ = q as any;
+      const choices = (QQ.choices ?? []) as string[];
+      const ansRaw = String(QQ.answer ?? "").trim();
 
-      // ✅ 공통 채점 로직 사용 (숫자/알파벳/텍스트 모두 처리)
       const graded = gradeAnswer({
         choices,
-        correctAnswer: Q.answer,
+        correctAnswer: QQ.answer,
         userAnswer: user_answer,
       });
 
-      // ✅ 로그 저장: q_id 채워서 NOT NULL 오류 방지
+      // ✅ 로그 저장
       const { error: logErr } = await supabase.from("study_logs").insert({
         user_id,
-        q_id: Q.q_id,
+        q_id: QQ.q_id,
         event_type: "quiz_attempt",
-        ref_id: String(Q.q_id),
-        mode: Q.mode,
-        level: Q.level,
+        ref_id: String(QQ.q_id),
+        mode: QQ.mode,
+        level: QQ.level,
         is_correct: graded.isCorrect,
         signal: signal ?? "neutral",
       });
-
       if (logErr) throw logErr;
 
       const dbgPicked =
-        graded.userPickIndex != null && choices[graded.userPickIndex] != null
-          ? `${graded.userPickIndex + 1}번 (${choices[graded.userPickIndex]})`
+        graded.userPickIndex != null
+          ? `${graded.userPickIndex + 1}번${
+              choices[graded.userPickIndex]
+                ? ` (${choices[graded.userPickIndex]})`
+                : ""
+            }`
           : graded.raw;
 
-      const text = `${graded.isCorrect ? "✅ 정답" : "❌ 오답"}
+      const text = `${graded.isCorrect ? "✅ 정답입니다!" : "❌ 아쉽지만 오답입니다."}
 
 - 내가 보낸 답: ${String(user_answer).trim()}
 - 해석된 선택: ${dbgPicked}
-- 정답(저장값): ${graded.ansStr}
-- 해설: ${Q.explanation ?? "(해설 없음)"}
+- 정답(저장값): ${ansRaw}
+- 해설: ${QQ.explanation ?? "(해설 없음)"}
 
-문제가 너무 쉽거나 너무 어렵게 느껴지면, 채팅으로 "쉬워요" 또는 "어려워요"라고 편하게 말씀해 주세요.
+문제가 너무 쉽거나 너무 어렵게 느껴지면,
+채팅으로 "쉬워요" 또는 "어려워요"라고 편하게 말씀해 주세요.
 다음 문제 난이도를 조정할 때 참고하겠습니다.`;
 
       return { content: [{ type: "text", text }] };
@@ -634,13 +661,15 @@ server.tool(
     if (error) throw error;
 
     const text =
-`📌 복습 아이템 (${data?.length ?? 0}개)` +
+      `📌 복습 아이템 (${data?.length ?? 0}개)` +
       (data && data.length
         ? "\n" +
           data
             .map(
               (it: any, idx: number) =>
-                `${idx + 1}) [${it.item_type}] **${it.key}**\n- payload: ${JSON.stringify(it.payload)}`
+                `${idx + 1}) [${it.item_type}] **${it.key}**\n- payload: ${JSON.stringify(
+                  it.payload
+                )}`
             )
             .join("\n")
         : "\n(없음)");
@@ -686,7 +715,7 @@ server.tool(
     const savedVocab = (saved ?? []).filter((x: any) => x.item_type === "vocab").length;
 
     const text =
-`📊 최근 ${days}일 요약
+      `📊 최근 ${days}일 요약
 - 퀴즈 시도: ${total}회
 - 오답: ${wrong}개
 - 저장 아이템: ${savedTotal}개 (단어 ${savedVocab}개)`;
