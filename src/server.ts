@@ -1,4 +1,4 @@
-// server.ts
+// index.ts
 import "dotenv/config";
 import express, { type Request, type Response } from "express";
 import { randomUUID } from "crypto";
@@ -26,7 +26,7 @@ type Mode = z.infer<typeof ModeEnum>;
 const SignalEnum = z.enum(["hard", "easy", "neutral"]).optional();
 
 const GetQuestionArgs = z.object({
-  user_id: z.string().min(1).optional(), // ✅ optional (중복문제 방지 + pending 저장)
+  user_id: z.string().min(1).optional(), // ✅ optional (kakao demo)
   mode: ModeEnum,
   level: z.number().int().min(1).max(10),
 });
@@ -42,7 +42,8 @@ const SaveItemArgs = z.object({
   user_id: z.string().min(1).optional(), // ✅ optional
   item_type: z.enum(["vocab", "mistake", "note"]),
   key: z.string().min(1),
-  payload: z.record(z.string(), z.unknown()).optional().default({}), // ✅ payload 없어도 되게
+  // ✅ payload 없는 호출도 허용 (카카오에서 key만 보내는 케이스)
+  payload: z.record(z.string(), z.unknown()).optional().default({}),
 });
 
 const GetReviewItemsArgs = z.object({
@@ -74,7 +75,7 @@ const PlacementSubmitArgs = z.object({
   signal: SignalEnum,
 });
 
-// ✅ 채팅 오케스트레이터
+/* ------------------------------ Chat Orchestrator ------------------------------ */
 const HandleUserMessageArgs = z.object({
   user_id: z.string().min(1).optional(),
   message: z.string().min(1),
@@ -136,117 +137,10 @@ function safeJsonRpcError(res: Response, message = "Internal Server Error") {
   });
 }
 
-// 선택지 채점 헬퍼 (1/A/B/C/D 다 처리)
-function gradeAnswer(opts: { choices: string[]; correctAnswer: unknown; userAnswer: string }) {
-  const { choices } = opts;
-
-  const raw = String(opts.userAnswer ?? "").trim();
-  const upper = raw.toUpperCase();
-
-  const alphaMap: Record<string, number> = { A: 0, B: 1, C: 2, D: 3, E: 4 };
-
-  let userPickIndex: number | null = null;
-
-  // 숫자(1,2,3,4..)
-  if (/^\d+$/.test(raw)) {
-    const n = Number(raw);
-    if (Number.isFinite(n) && n >= 1) userPickIndex = n - 1;
-  }
-
-  // 알파벳(A,B,C,D..)
-  if (upper in alphaMap) userPickIndex = alphaMap[upper];
-
-  const userPickValue =
-    userPickIndex !== null && choices[userPickIndex] != null
-      ? String(choices[userPickIndex]).trim()
-      : raw;
-
-  const ansStr = String(opts.correctAnswer ?? "").trim();
-  const ansUpper = ansStr.toUpperCase();
-
-  // 정답이 "1","2"처럼 숫자 인덱스인 경우
-  if (/^\d+$/.test(ansStr) && userPickIndex !== null) {
-    const ansIndex = Number(ansStr) - 1;
-    return { isCorrect: ansIndex === userPickIndex, raw, userPickIndex, userPickValue, ansStr };
-  }
-
-  // 정답이 "A","B"처럼 알파벳인 경우
-  if (ansStr.length === 1 && ansUpper in alphaMap && userPickIndex !== null) {
-    return { isCorrect: alphaMap[ansUpper] === userPickIndex, raw, userPickIndex, userPickValue, ansStr };
-  }
-
-  // 그 외에는 텍스트 비교
-  const isCorrect =
-    userPickValue.trim().toUpperCase() === ansUpper || raw.trim().toUpperCase() === ansUpper;
-
-  return { isCorrect, raw, userPickIndex, userPickValue, ansStr };
-}
-
-function modeKo(mode: Mode): string {
-  switch (mode) {
-    case "toeic":
-      return "토익";
-    case "grammar":
-      return "문법";
-    case "travel":
-      return "여행";
-    case "business":
-      return "비즈니스";
-    case "vocab":
-      return "단어";
-  }
-}
-
-function parseModeFromMessage(msg: string): Mode | null {
-  const m = msg.trim().toLowerCase();
-
-  if (m.includes("토익") || m.includes("toeic")) return "toeic";
-  if (m.includes("문법") || m.includes("grammar")) return "grammar";
-  if (m.includes("여행") || m.includes("travel")) return "travel";
-  if (m.includes("비즈니스") || m.includes("business")) return "business";
-  if (m.includes("단어") || m.includes("어휘") || m.includes("vocab")) return "vocab";
-  return null;
-}
-
-function isEasySignal(msg: string) {
-  const m = msg.replace(/\s+/g, "");
-  return m.includes("쉬워") || m.includes("쉽") || m === "easy";
-}
-
-function isHardSignal(msg: string) {
-  const m = msg.replace(/\s+/g, "");
-  return m.includes("어려") || m.includes("어렵") || m === "hard";
-}
-
-function isNext(msg: string) {
-  const m = msg.replace(/\s+/g, "");
-  return m === "다음" || m === "계속" || m === "gogo" || m.includes("ㄱㄱ");
-}
-
-function isStop(msg: string) {
-  const m = msg.replace(/\s+/g, "");
-  return m === "그만" || m === "종료" || m === "끝" || m.includes("그만할래");
-}
-
-function isSummary(msg: string) {
-  const m = msg.replace(/\s+/g, "");
-  return m.includes("요약") || m.includes("정리") || m.includes("오늘공부") || m.includes("오늘공부한내용");
-}
-
-function isMistakeNote(msg: string) {
-  const m = msg.replace(/\s+/g, "");
-  return m.includes("오답노트") || (m.includes("오답") && (m.includes("정리") || m.includes("보여") || m.includes("내놔")));
-}
-
-function isAnswerToken(msg: string) {
-  const t = msg.trim();
-  return /^[1-9]\d*$/.test(t) || /^[a-eA-E]$/.test(t);
-}
-
-/* ----------------------------- KST Day Range ------------------------------ */
-function getKstDayRangeISO(now = new Date()) {
+/* --------------------------- KST day helpers --------------------------- */
+function kstDayStartIso(date = new Date()) {
   // KST = UTC+9
-  const utcMs = now.getTime();
+  const utcMs = date.getTime();
   const kstMs = utcMs + 9 * 60 * 60 * 1000;
   const kst = new Date(kstMs);
 
@@ -254,277 +148,185 @@ function getKstDayRangeISO(now = new Date()) {
   const m = kst.getUTCMonth();
   const d = kst.getUTCDate();
 
-  const startKstMs = Date.UTC(y, m, d, 0, 0, 0);
-  const endKstMs = Date.UTC(y, m, d + 1, 0, 0, 0);
-
-  const startUtcMs = startKstMs - 9 * 60 * 60 * 1000;
-  const endUtcMs = endKstMs - 9 * 60 * 60 * 1000;
-
-  return {
-    startISO: new Date(startUtcMs).toISOString(),
-    endISO: new Date(endUtcMs).toISOString(),
-  };
+  // KST 00:00 -> UTC time = KST - 9h
+  const kstStartUtcMs = Date.UTC(y, m, d, 0, 0, 0) - 9 * 60 * 60 * 1000;
+  return new Date(kstStartUtcMs).toISOString();
 }
 
-/* --------------------------- Duplicate Avoidance -------------------------- */
-async function getRecentAttemptedQids(opts: { user_id: string; mode?: Mode; limit?: number }) {
-  const limit = opts.limit ?? 50;
-  let q = supabase
-    .from("study_logs")
-    .select("q_id, created_at, mode")
-    .eq("user_id", opts.user_id)
-    .in("event_type", ["quiz_attempt", "placement_attempt"])
-    .order("created_at", { ascending: false })
-    .limit(limit);
-
-  if (opts.mode) q = q.eq("mode", opts.mode);
-
-  const { data, error } = await q;
-  if (error) throw error;
-  return new Set((data ?? []).map((r: any) => String(r.q_id)));
+function normalizeText(s: string) {
+  return String(s ?? "").trim();
 }
 
-async function pickRandomQuestionAvoiding(mode: Mode, level: number, excludeQids?: Set<string>) {
-  const { data, error } = await supabase
+/* ----------------------- Strict answer parsing (fix "12") ----------------------- */
+/**
+ * ✅ 정답 입력을 "단일 토큰"만 허용:
+ * - 숫자: 1~5 (한 자리만)
+ * - 알파벳: A~E (한 글자만)
+ * - 그 외: 텍스트(주관식처럼) (선택지 비교용)
+ *
+ * "12" 같은 입력은 숫자로 취급하지 않음 → 그대로 텍스트로 남아 오답 처리됨.
+ */
+function parseSingleChoiceToken(rawInput: string) {
+  const raw = normalizeText(rawInput);
+  const upper = raw.toUpperCase();
+
+  // 숫자 한 자리만 허용 (1~5)
+  if (/^[1-5]$/.test(raw)) {
+    return { kind: "index" as const, index: Number(raw) - 1, raw };
+  }
+
+  // 알파벳 한 글자만 허용 (A~E)
+  if (/^[A-E]$/.test(upper)) {
+    const alphaMap: Record<string, number> = { A: 0, B: 1, C: 2, D: 3, E: 4 };
+    return { kind: "index" as const, index: alphaMap[upper], raw };
+  }
+
+  return { kind: "text" as const, text: raw, raw };
+}
+
+// 선택지 채점 헬퍼 (엄격 토큰 + 텍스트 비교)
+function gradeAnswer(opts: {
+  choices: string[];
+  correctAnswer: unknown;
+  userAnswer: string;
+}) {
+  const { choices } = opts;
+
+  const token = parseSingleChoiceToken(opts.userAnswer);
+  const ansStr = normalizeText(String(opts.correctAnswer ?? ""));
+  const ansUpper = ansStr.toUpperCase();
+
+  let userPickIndex: number | null = null;
+  let userPickValue: string = token.raw;
+
+  if (token.kind === "index") {
+    userPickIndex = token.index;
+    userPickValue =
+      choices[userPickIndex] != null ? normalizeText(String(choices[userPickIndex])) : token.raw;
+  } else {
+    userPickIndex = null;
+    userPickValue = token.text;
+  }
+
+  // 정답이 "1"~"5" 처럼 숫자 인덱스인 경우
+  if (/^[1-5]$/.test(ansStr) && userPickIndex !== null) {
+    const ansIndex = Number(ansStr) - 1;
+    return {
+      isCorrect: ansIndex === userPickIndex,
+      raw: token.raw,
+      userPickIndex,
+      userPickValue,
+      ansStr,
+    };
+  }
+
+  // 정답이 "A"~"E" 알파벳인 경우
+  if (/^[A-E]$/.test(ansUpper) && userPickIndex !== null) {
+    const alphaMap: Record<string, number> = { A: 0, B: 1, C: 2, D: 3, E: 4 };
+    return {
+      isCorrect: alphaMap[ansUpper] === userPickIndex,
+      raw: token.raw,
+      userPickIndex,
+      userPickValue,
+      ansStr,
+    };
+  }
+
+  // 그 외에는 텍스트 비교
+  const isCorrect =
+    normalizeText(userPickValue).toUpperCase() === ansUpper ||
+    normalizeText(token.raw).toUpperCase() === ansUpper;
+
+  return { isCorrect, raw: token.raw, userPickIndex, userPickValue, ansStr };
+}
+
+/* ----------------------------- Anti-repeat picking ----------------------------- */
+const RECENT_EXCLUDE_COUNT = 20;
+
+/**
+ * user_id가 있으면 최근 풀이한 q_id를 제외하고 랜덤 픽
+ * (DB가 적어서 중복될 수 있으니, 그래도 없으면 레벨 클리어 트리거용으로 null 리턴)
+ */
+async function pickRandomQuestionForUser(params: {
+  user_id?: string;
+  mode: Mode;
+  level: number;
+}) {
+  const { user_id, mode, level } = params;
+
+  let excludeIds: string[] = [];
+
+  if (user_id) {
+    const { data: recent, error: rErr } = await supabase
+      .from("study_logs")
+      .select("q_id, created_at")
+      .eq("user_id", user_id)
+      .eq("mode", mode)
+      .order("created_at", { ascending: false })
+      .limit(RECENT_EXCLUDE_COUNT);
+
+    if (rErr) throw rErr;
+    excludeIds = (recent ?? []).map((x: any) => String(x.q_id));
+  }
+
+  let query = supabase
     .from("questions")
     .select("q_id, mode, level, prompt, choices, answer, explanation, media")
     .eq("mode", mode)
     .eq("level", level)
     .eq("is_active", true)
-    .limit(80);
+    .limit(50);
 
+  if (excludeIds.length) query = query.not("q_id", "in", `(${excludeIds.join(",")})`);
+
+  const { data, error } = await query;
   if (error) throw error;
-  const list = (data ?? []) as any[];
-  if (list.length === 0) return null;
+  if (!data || data.length === 0) return null;
 
-  const filtered = excludeQids ? list.filter((x) => !excludeQids.has(String(x.q_id))) : list;
-  const pool = filtered.length > 0 ? filtered : list; // 다 막히면 그냥 pool fallback
-
-  const idx = Math.floor(Math.random() * pool.length);
-  return pool[idx] as any;
+  const idx = Math.floor(Math.random() * data.length);
+  return data[idx] as any;
 }
 
-function formatChoicesWithNumbers(choices: string[]) {
-  // ✅ 항상 "1. A. ..." 형태가 나오게
-  return choices.length ? choices.map((c, i) => `${i + 1}. ${c}`).join("\n") : "(선택지가 없습니다)";
-}
-
-/* ------------------------------ One-time UX ------------------------------- */
-// ✅ “난이도 어때요?” 안내를 계속 반복하지 않기 위해 서버 메모리에 1회만 띄움
-const difficultyNudgeShown = new Map<string, number>(); // user_id -> timestamp(ms)
-const DIFF_NUDGE_TTL = 1000 * 60 * 60 * 12; // 12시간 내에는 다시 안 띄움
-
-function shouldShowDifficultyNudge(user_id: string) {
-  const now = Date.now();
-  const last = difficultyNudgeShown.get(user_id) ?? 0;
-  if (now - last > DIFF_NUDGE_TTL) {
-    difficultyNudgeShown.set(user_id, now);
-    return true;
-  }
-  return false;
-}
-
-/* ------------------------------- Pending Q ------------------------------- */
-// ✅ 채팅형: “답만 보내면 채점” 되도록 마지막으로 낸 문제 기억
-type Pending = { q_id: string; mode: Mode; level: number; sent_at: string };
-const pendingByUser = new Map<string, Pending>();
-
-/* ------------------------ Level Clear / Promotion ------------------------- */
-async function getConsecutiveCorrectAtLevel(opts: { user_id: string; mode: Mode; level: number; limit?: number }) {
-  const limit = opts.limit ?? 20;
-  const { data, error } = await supabase
-    .from("study_logs")
-    .select("is_correct, level, created_at")
-    .eq("user_id", opts.user_id)
-    .eq("event_type", "quiz_attempt")
-    .eq("mode", opts.mode)
-    .order("created_at", { ascending: false })
-    .limit(limit);
-
-  if (error) throw error;
-  let streak = 0;
-  for (const row of data ?? []) {
-    if (Number(row.level) !== opts.level) break;
-    if (row.is_correct === true) streak += 1;
-    else break;
-  }
-  return streak;
-}
-
-const awaitingPromotionDecision = new Map<string, { mode: Mode; fromLevel: number; askedAt: number }>();
-function isPromotionYes(msg: string) {
-  const m = msg.replace(/\s+/g, "");
-  return m === "올려" || m === "올려줘" || m.includes("다음레벨") || m.includes("올릴까") || m.includes("올려요") || m === "y";
-}
-function isPromotionNo(msg: string) {
-  const m = msg.replace(/\s+/g, "");
-  return m === "유지" || m.includes("그대로") || m.includes("아니") || m === "n";
-}
-
-/* ----------------------------- Auto Save Mistake -------------------------- */
-async function autoSaveMistake(opts: {
-  user_id: string;
-  q: any;
-  graded: ReturnType<typeof gradeAnswer>;
-  user_answer: string;
-}) {
-  if (opts.graded.isCorrect) return;
-
-  const item_id = randomUUID();
-  const key = String(opts.q.q_id);
-
-  const payload = {
-    mode: opts.q.mode,
-    level: opts.q.level,
-    prompt: opts.q.prompt,
-    choices: opts.q.choices ?? [],
-    correct_answer: String(opts.q.answer ?? ""),
-    explanation: opts.q.explanation ?? null,
-    user_answer: opts.graded.userPickValue ?? opts.graded.raw ?? opts.user_answer,
-    created_at: new Date().toISOString(),
-  };
-
-  const { error } = await supabase.from("review_items").insert({
-    item_id,
-    user_id: opts.user_id,
-    item_type: "mistake",
-    key,
-    payload,
-    strength: 1,
-    last_seen_at: new Date().toISOString(),
-    created_at: new Date().toISOString(),
-  });
-
-  // 중복 저장/제약 에러 등은 학습 흐름을 깨지 않도록 무시(로그만)
-  if (error) {
-    // eslint-disable-next-line no-console
-    console.warn("[autoSaveMistake] failed:", error.message);
-  }
-}
-
-/* --------------------------- Today Summary Builder ------------------------ */
-async function buildTodayFullSummary(user_id: string) {
-  const { startISO, endISO } = getKstDayRangeISO(new Date());
-
-  const { data: logs, error: lErr } = await supabase
-    .from("study_logs")
-    .select("q_id, mode, level, is_correct, user_answer, created_at")
-    .eq("user_id", user_id)
-    .eq("event_type", "quiz_attempt")
-    .gte("created_at", startISO)
-    .lt("created_at", endISO)
-    .order("created_at", { ascending: true });
-
-  if (lErr) throw lErr;
-
-  const rows = logs ?? [];
-  if (rows.length === 0) {
-    return "오늘 푼 문제가 아직 없어요. \"다음\"이라고 보내면 바로 시작할게요.";
-  }
-
-  const qids = Array.from(new Set(rows.map((r: any) => String(r.q_id))));
-  const { data: qs, error: qErr } = await supabase
+/**
+ * 레벨 내 활성 문제 수 / 유저가 푼 문제 수를 비교해서 "고갈"인지 판단
+ */
+async function isLevelExhausted(user_id: string, mode: Mode, level: number) {
+  const { count: totalCount, error: tErr } = await supabase
     .from("questions")
-    .select("q_id, prompt, choices, answer, explanation, mode, level, media")
-    .in("q_id", qids);
+    .select("*", { count: "exact", head: true })
+    .eq("mode", mode)
+    .eq("level", level)
+    .eq("is_active", true);
 
-  if (qErr) throw qErr;
-  const qMap = new Map<string, any>((qs ?? []).map((q: any) => [String(q.q_id), q]));
+  if (tErr) throw tErr;
 
-  let out = `📌 오늘 학습 정리 (문제+정답+해설)\n`;
-  out += `- 총 ${rows.length}문제\n\n`;
-
-  rows.forEach((r: any, idx: number) => {
-    const q = qMap.get(String(r.q_id));
-    if (!q) return;
-    const choices = (q.choices ?? []) as string[];
-    const mediaMd = q.media?.image ? `\n![image](${q.media.image})\n` : "";
-    out += `#${idx + 1}) ${modeKo(q.mode)} Lv.${q.level}\n`;
-    out += `${q.prompt}${mediaMd}\n\n`;
-    out += `${formatChoicesWithNumbers(choices)}\n\n`;
-    out += `- 내 답: ${String(r.user_answer ?? "").trim()}\n`;
-    out += `- 결과: ${r.is_correct ? "✅ 정답" : "❌ 오답"}\n`;
-    out += `- 정답: ${String(q.answer ?? "").trim()}\n`;
-    out += `- 해설: ${q.explanation ?? "(해설 없음)"}\n`;
-    out += `\n---\n\n`;
-  });
-
-  out += `원하면 "오답노트"라고 보내면 오늘 틀린 것만 모아서 + 바로 복습문제까지 이어서 줄게요.`;
-  return out;
-}
-
-async function buildTodayMistakeNoteWithReview(user_id: string) {
-  const { startISO, endISO } = getKstDayRangeISO(new Date());
-
-  const { data: logs, error: lErr } = await supabase
+  const { data: solved, error: sErr } = await supabase
     .from("study_logs")
-    .select("q_id, mode, level, is_correct, user_answer, created_at")
+    .select("q_id")
     .eq("user_id", user_id)
+    .eq("mode", mode)
     .eq("event_type", "quiz_attempt")
-    .eq("is_correct", false)
-    .gte("created_at", startISO)
-    .lt("created_at", endISO)
-    .order("created_at", { ascending: true });
+    .eq("level", level);
 
-  if (lErr) throw lErr;
+  if (sErr) throw sErr;
 
-  const wrongRows = logs ?? [];
-  if (wrongRows.length === 0) {
-    return `✅ 오늘 오답이 없어요.\n\n원하면 "다음"으로 계속 풀거나, "정리"로 오늘 푼 문제 전체를 묶어서 볼 수 있어요.`;
-  }
+  const solvedUnique = new Set((solved ?? []).map((x: any) => String(x.q_id))).size;
+  const total = Number(totalCount ?? 0);
 
-  const qids = Array.from(new Set(wrongRows.map((r: any) => String(r.q_id))));
-  const { data: qs, error: qErr } = await supabase
-    .from("questions")
-    .select("q_id, prompt, choices, answer, explanation, mode, level, media")
-    .in("q_id", qids);
-
-  if (qErr) throw qErr;
-  const qMap = new Map<string, any>((qs ?? []).map((q: any) => [String(q.q_id), q]));
-
-  let out = `🧾 오늘 오답노트 (문제+정답+해설)\n`;
-  out += `- 오답 ${wrongRows.length}개\n\n`;
-
-  // 오답 정리
-  wrongRows.forEach((r: any, idx: number) => {
-    const q = qMap.get(String(r.q_id));
-    if (!q) return;
-    const choices = (q.choices ?? []) as string[];
-    const mediaMd = q.media?.image ? `\n![image](${q.media.image})\n` : "";
-    out += `#오답 ${idx + 1}) ${modeKo(q.mode)} Lv.${q.level}\n`;
-    out += `${q.prompt}${mediaMd}\n\n`;
-    out += `${formatChoicesWithNumbers(choices)}\n\n`;
-    out += `- 내 답: ${String(r.user_answer ?? "").trim()}\n`;
-    out += `- 정답: ${String(q.answer ?? "").trim()}\n`;
-    out += `- 해설: ${q.explanation ?? "(해설 없음)"}\n`;
-    out += `\n---\n\n`;
-  });
-
-  // ✅ 바로 복습문제(유사/대체)로 이어가기: 같은 mode/비슷한 level에서 “안 푼 문제” 랜덤 제공
-  const first = wrongRows[0] as any;
-  const mode = (first.mode ?? "toeic") as Mode;
-  const baseLevel = Number(first.level ?? 3);
-
-  const recent = await getRecentAttemptedQids({ user_id, mode, limit: 120 });
-  const reviewQ1 = await pickRandomQuestionAvoiding(mode, Math.max(1, baseLevel), recent);
-  if (!reviewQ1) {
-    out += `✅ 복습 문제를 더 찾지 못했어요. (questions 테이블에 문제를 추가해 주세요)\n`;
-    return out;
-  }
-
-  // pending 등록
-  pendingByUser.set(user_id, { q_id: String(reviewQ1.q_id), mode: reviewQ1.mode, level: Number(reviewQ1.level), sent_at: new Date().toISOString() });
-
-  const rChoices = (reviewQ1.choices ?? []) as string[];
-  const mediaMd = reviewQ1.media?.image ? `\n\n![image](${reviewQ1.media.image})\n` : "";
-
-  out += `🧪 복습 문제 (오늘 오답 기반 확인)\n`;
-  out += `🧩 ${modeKo(reviewQ1.mode)} Lv.${reviewQ1.level}\n`;
-  out += `${reviewQ1.prompt}${mediaMd}\n\n`;
-  out += `${formatChoicesWithNumbers(rChoices)}\n\n`;
-  out += `정답은 **숫자(1~)** 또는 **A~E** 로 보내 주세요.\n`;
-  return out;
+  // total이 너무 적으면 (예: 0/1/2문제) 클리어 판정이 너무 빨리 될 수 있으니 보호
+  if (total <= 0) return { exhausted: true, total, solvedUnique };
+  return { exhausted: solvedUnique >= total, total, solvedUnique };
 }
+
+/* ----------------------------- One-time difficulty message ----------------------------- */
+const difficultyPromptShown: Record<string, boolean> = {};
+
+/* ----------------------------- Pending state (level clear / menu) ----------------------------- */
+type PendingState =
+  | { type: "level_clear"; mode: Mode; level: number }
+  | { type: "post_clear_menu"; mode: Mode; level: number };
+
+const pending: Record<string, PendingState | undefined> = {};
 
 /* ----------------------------- Placement Config --------------------------- */
 const PLACEMENT_QUESTION_COUNT = 5;
@@ -562,74 +364,10 @@ server.tool(
 
       return { content: [{ type: "text", text: JSON.stringify(payload, null, 2) }] };
     } catch (e) {
-      return { content: [{ type: "text", text: `get_user_state 실패: ${safeErrorText(e)}` }], isError: true };
-    }
-  }
-);
-
-/* --------------------------- Tool: placement_start -------------------------- */
-server.tool(
-  "placement_start",
-  "레벨 진단을 시작하고 placement_id와 첫 문제를 반환합니다. (총 5문제)",
-  { user_id: z.string().min(1).optional(), mode: ModeEnum },
-  async (args) => {
-    try {
-      const parsed = PlacementStartArgs.parse(args);
-      const user_id = resolveUserId(parsed.user_id);
-      const mode = parsed.mode;
-      await ensureUser(user_id, mode);
-
-      // 유저 기본 레벨에서 시작
-      const { data: u, error: uErr } = await supabase
-        .from("users")
-        .select("current_level")
-        .eq("user_id", user_id)
-        .maybeSingle();
-      if (uErr) throw uErr;
-
-      const startLevel = Number((u as any)?.current_level ?? 3);
-
-      const placement_id = randomUUID();
-
-      // 첫 문제
-      const recent = await getRecentAttemptedQids({ user_id, mode, limit: 80 });
-      const q = await pickRandomQuestionAvoiding(mode, startLevel, recent);
-      if (!q) {
-        return { content: [{ type: "text", text: "진단용 문제를 찾지 못했습니다. questions 테이블에 문제를 추가해 주세요." }], isError: true };
-      }
-
-      // 세션 생성
-      const newSession: any = {
-        placement_id,
-        user_id,
-        mode,
-        asked_count: 0,
-        correct_count: 0,
-        current_level: startLevel,
-        last_q_id: q.q_id,
-        is_done: false,
-        created_at: new Date().toISOString(),
-        started_at: new Date().toISOString(),
+      return {
+        content: [{ type: "text", text: `get_user_state 실패: ${safeErrorText(e)}` }],
+        isError: true,
       };
-
-      const { error: insErr } = await supabase.from("placement_sessions").insert(newSession);
-      if (insErr) throw insErr;
-
-      const choices = (q.choices ?? []) as string[];
-      const mediaMd = q.media?.image ? `\n\n![image](${q.media.image})\n` : "";
-
-      const text =
-        `🧪 레벨 진단 시작! (총 ${PLACEMENT_QUESTION_COUNT}문제)\n` +
-        `placement_id: \`${placement_id}\`\n\n` +
-        `🧩 ${modeKo(q.mode)} Lv.${q.level}\n` +
-        `${q.prompt}${mediaMd}\n\n` +
-        `${formatChoicesWithNumbers(choices)}\n\n` +
-        `정답은 **숫자(1~)** 또는 **A~E** 로 보내 주세요.\n` +
-        `※ 진단 답안 제출 시 tool: placement_submit 을 사용하세요 (placement_id/q_id 필요).`;
-
-      return { content: [{ type: "text", text }] };
-    } catch (e) {
-      return { content: [{ type: "text", text: `placement_start 실패: ${safeErrorText(e)}` }], isError: true };
     }
   }
 );
@@ -661,7 +399,10 @@ server.tool(
         .maybeSingle();
       if (qErr) throw qErr;
       if (!q) {
-        return { content: [{ type: "text", text: "문제(q_id)를 찾지 못했습니다." }], isError: true };
+        return {
+          content: [{ type: "text", text: "문제(q_id)를 찾지 못했습니다." }],
+          isError: true,
+        };
       }
 
       const Q = q as any;
@@ -669,7 +410,7 @@ server.tool(
       const mode = (Q.mode ?? "toeic") as Mode;
       let level = Number(Q.level ?? 3);
 
-      // 2) 세션 조회 (없으면 새로 생성)
+      // 2) 세션 조회 (없으면 생성)
       const { data: sRow, error: sErr } = await supabase
         .from("placement_sessions")
         .select("*")
@@ -698,21 +439,25 @@ server.tool(
       }
 
       if (session.is_done) {
-        return { content: [{ type: "text", text: "이미 완료된 진단입니다. 다시 시작하려면 placement_start를 호출해 주세요." }], isError: true };
+        return {
+          content: [{ type: "text", text: "이미 완료된 진단입니다. 다시 시작하려면 '테스트 다시'라고 말씀해 주세요." }],
+          isError: true,
+        };
       }
 
       // 3) 채점
-      const graded = gradeAnswer({ choices, correctAnswer: Q.answer, userAnswer: user_answer });
+      const graded = gradeAnswer({
+        choices,
+        correctAnswer: Q.answer,
+        userAnswer: user_answer,
+      });
 
       const asked = Number(session.asked_count ?? 0) + 1;
       const correct = Number(session.correct_count ?? 0) + (graded.isCorrect ? 1 : 0);
 
       level = Number(session.current_level ?? level);
-      if (graded.isCorrect) {
-        level = Math.min(10, level + 1);
-      } else if (signal === "hard") {
-        level = Math.max(1, level - 1);
-      }
+      if (graded.isCorrect) level = Math.min(10, level + 1);
+      else if (signal === "hard") level = Math.max(1, level - 1);
 
       const done = asked >= PLACEMENT_QUESTION_COUNT;
 
@@ -748,30 +493,25 @@ server.tool(
       if (done) {
         const { error: uUpErr } = await supabase
           .from("users")
-          .update({
-            current_level: level,
-            placement_done: true,
-            last_mode: mode,
-          })
+          .update({ current_level: level, placement_done: true, last_mode: mode })
           .eq("user_id", user_id);
         if (uUpErr) throw uUpErr;
 
-        const text = `✅ 레벨 진단이 끝났어요!
+        const text = `✅ 레벨 진단 완료!
 
 - 맞힌 문제: ${correct}/${asked}
 - 최종 레벨: Lv.${level}
 
-이제 "${modeKo(mode)} Lv.${level}" 기준으로 문제를 낼게요.
-"다음"이라고 보내면 바로 시작합니다.`;
+이제 이 레벨 기준으로 문제를 풀 수 있어요.
+"시작" 또는 "다음"이라고 보내면 바로 문제를 낼게요.`;
         return { content: [{ type: "text", text }] };
       }
 
-      // 7) 다음 문제 (중복 회피 랜덤)
-      const recent = await getRecentAttemptedQids({ user_id, mode, limit: 120 });
-      const nextQ = await pickRandomQuestionAvoiding(mode, level, recent);
+      // 7) 다음 문제
+      const nextQ = await pickRandomQuestionForUser({ user_id, mode, level });
       if (!nextQ) {
         return {
-          content: [{ type: "text", text: "다음 문제를 찾지 못했습니다. (questions 테이블에 is_active=true 문제를 더 추가해 주세요)" }],
+          content: [{ type: "text", text: "다음 문제를 찾지 못했습니다. (DB에 문제를 더 추가해 주세요)" }],
           isError: true,
         };
       }
@@ -779,19 +519,24 @@ server.tool(
       const nChoices = (nextQ.choices ?? []) as string[];
       const mediaMd = nextQ.media?.image ? `\n\n![image](${nextQ.media.image})\n` : "";
 
-      const feedback =
-        `${graded.isCorrect ? "✅ 정답이에요!" : "❌ 오답이에요."}\n` +
-        `- 내 답: ${graded.raw}\n` +
-        `- 정답: ${graded.ansStr}\n` +
-        `- 해설: ${Q.explanation ?? "(해설 없음)"}\n\n` +
-        `현재 임시 레벨: Lv.${level}`;
+      const feedback = `${graded.isCorrect ? "✅ 정답!" : "❌ 오답!"}
+- 내가 보낸 답: ${graded.raw}
+- 정답: ${graded.ansStr}
+- 해설: ${Q.explanation ?? "(해설 없음)"}
 
-      const nextText =
-        `🧩 ${modeKo(nextQ.mode)} Lv.${nextQ.level}\n` +
-        `${nextQ.prompt}${mediaMd}\n\n` +
-        `${formatChoicesWithNumbers(nChoices)}\n\n` +
-        `q_id: \`${nextQ.q_id}\`\n` +
-        `정답은 **숫자(1~)** 또는 **A~E** 로 보내 주세요.`;
+현재 임시 레벨: Lv.${level}
+`;
+
+      const nextText = `🧩 ${nextQ.mode.toUpperCase()} Lv.${nextQ.level}
+${nextQ.prompt}${mediaMd}
+
+${
+  nChoices.length ? nChoices.map((c: string, i: number) => `${i + 1}. ${c}`).join("\n") : "(선택지가 없습니다)"
+}
+
+q_id: \`${nextQ.q_id}\`
+
+정답은 **숫자(1~)** 또는 **A~E**로 보내 주세요.`;
 
       return { content: [{ type: "text", text: `${feedback}\n\n${nextText}` }] };
     } catch (e) {
@@ -803,37 +548,52 @@ server.tool(
 /* ------------------------------ Tool: get_question ------------------------------ */
 server.tool(
   "get_question",
-  "모드/레벨에 맞는 활성(is_active=true) 객관식 문제 1개를 랜덤으로 가져옵니다. (최근에 푼 문제는 가능한 피함)",
-  { user_id: z.string().min(1).optional(), mode: ModeEnum, level: z.number().int().min(1).max(10) },
+  "모드/레벨에 맞는 활성(is_active=true) 객관식 문제 1개를 가져옵니다. (가능하면 중복 제외)",
+  { user_id: z.string().optional(), mode: ModeEnum, level: z.number().int().min(1).max(10) },
   async (args) => {
-    const { user_id: rawUid, mode, level } = GetQuestionArgs.parse(args);
-    const user_id = resolveUserId(rawUid);
-    await ensureUser(user_id, mode);
+    const parsed = GetQuestionArgs.parse(args);
+    const user_id = parsed.user_id ? resolveUserId(parsed.user_id) : undefined;
+    const { mode, level } = parsed;
 
-    const recent = await getRecentAttemptedQids({ user_id, mode, limit: 120 });
-    const q = await pickRandomQuestionAvoiding(mode, level, recent);
+    if (user_id) await ensureUser(user_id, mode);
+
+    const q = await pickRandomQuestionForUser({ user_id, mode, level });
 
     if (!q) {
-      return { content: [{ type: "text", text: "해당 모드/레벨에 활성화된 문제가 없습니다." }] };
-    }
+      // user_id가 있으면 레벨 고갈 체크 후 안내
+      if (user_id) {
+        const ex = await isLevelExhausted(user_id, mode, level);
+        if (ex.exhausted) {
+          pending[user_id] = { type: "level_clear", mode, level };
+          const text = `🎉 ${mode.toUpperCase()} Lv.${level} 레벨 문제를 모두 풀었어요! (활성 문제 ${ex.total}개 / 풀이 ${ex.solvedUnique}개)
 
-    // ✅ pending 저장 (답만 오면 채점 가능)
-    pendingByUser.set(user_id, { q_id: String(q.q_id), mode, level: Number(q.level), sent_at: new Date().toISOString() });
+다음 레벨(Lv.${Math.min(10, level + 1)})로 넘어갈까요?
+- ㅇㅇ : 다음 레벨로 이동
+- ㄴㄴ : Lv.${level} 복습 / 다른 모드 선택`;
+          return { content: [{ type: "text", text }] };
+        }
+      }
+
+      return {
+        content: [{ type: "text", text: "해당 모드/레벨에 활성화된 문제가 없습니다. (DB에 문제 추가 필요)" }],
+      };
+    }
 
     const choices = (q.choices ?? []) as string[];
     const mediaMd = q.media?.image ? `\n\n![image](${q.media.image})\n` : "";
 
-    const nudge = shouldShowDifficultyNudge(user_id)
-      ? `\n\n난이도는 한 번만 물어볼게요.\n현재 레벨이 **쉬우면 "쉬워요"**, **어려우면 "어려워요"**라고 말해주면 다음부터 조정할게요.`
-      : "";
+    const header = `🧩 ${String(q.mode).toUpperCase()} Lv.${Number(q.level)}`;
 
-    const text =
-      `🧩 ${modeKo(q.mode)} Lv.${q.level}\n` +
-      `${q.prompt}${mediaMd}\n\n` +
-      `${formatChoicesWithNumbers(choices)}\n\n` +
-      `q_id: \`${q.q_id}\`\n` +
-      `정답은 **숫자(1~)** 또는 **A~E** 로 보내 주세요.` +
-      nudge;
+    const text = `${header}
+${q.prompt}${mediaMd}
+
+${
+  choices.length ? choices.map((c: string, i: number) => `${i + 1}. ${c}`).join("\n") : "(선택지가 없습니다)"
+}
+
+q_id: \`${q.q_id}\`
+
+정답은 **숫자(1~)** 또는 **A~E**로 보내 주세요.`;
 
     return { content: [{ type: "text", text }] };
   }
@@ -842,7 +602,7 @@ server.tool(
 /* ------------------------------- Tool: submit_answer ------------------------------- */
 server.tool(
   "submit_answer",
-  "정답 체크 + study_logs 저장 + (오답이면 자동으로 오답노트(review_items)에 저장)",
+  "정답 체크 + study_logs 저장 (난이도 멘트는 반복하지 않음)",
   {
     user_id: z.string().optional(),
     q_id: z.string().uuid(),
@@ -871,9 +631,13 @@ server.tool(
 
       const QQ = q as any;
       const choices = (QQ.choices ?? []) as string[];
-      const ansRaw = String(QQ.answer ?? "").trim();
+      const ansRaw = normalizeText(String(QQ.answer ?? ""));
 
-      const graded = gradeAnswer({ choices, correctAnswer: QQ.answer, userAnswer: user_answer });
+      const graded = gradeAnswer({
+        choices,
+        correctAnswer: QQ.answer,
+        userAnswer: user_answer,
+      });
 
       // ✅ 로그 저장
       const { error: logErr } = await supabase.from("study_logs").insert({
@@ -887,34 +651,27 @@ server.tool(
         user_answer: graded.userPickValue ?? graded.raw ?? user_answer,
         signal: signal ?? "neutral",
       });
-
       if (logErr) throw logErr;
 
-      // ✅ 오답이면 자동 저장 (오답노트가 “저장된게 없다”가 안 뜨게)
-      await autoSaveMistake({ user_id, q: QQ, graded, user_answer });
+      // (선택) 오답이면 자동 오답노트 후보로 저장해두고 싶다면 여기서 save_item 해도 됨.
+      // 지금은 "오답노트" 요청 시 study_logs 기반으로 뽑기 때문에 필수 아님.
 
       const dbgPicked =
         graded.userPickIndex != null
           ? `${graded.userPickIndex + 1}번${choices[graded.userPickIndex] ? ` (${choices[graded.userPickIndex]})` : ""}`
           : graded.raw;
 
-      let text =
-        `${graded.isCorrect ? "✅ 정답입니다!" : "❌ 오답입니다."}\n\n` +
-        `🧩 ${modeKo(QQ.mode)} Lv.${QQ.level}\n` +
-        `- 내가 보낸 답: ${String(user_answer).trim()}\n` +
-        `- 해석된 선택: ${dbgPicked}\n` +
-        `- 정답: ${ansRaw}\n` +
-        `- 해설: ${QQ.explanation ?? "(해설 없음)"}\n`;
+      const header = `🧩 ${String(QQ.mode).toUpperCase()} Lv.${Number(QQ.level)}`;
 
-      // ✅ 레벨 클리어/승급 제안 (같은 레벨 연속 정답 5회)
-      const streak = await getConsecutiveCorrectAtLevel({ user_id, mode: QQ.mode, level: Number(QQ.level), limit: 30 });
-      if (streak >= 5) {
-        awaitingPromotionDecision.set(user_id, { mode: QQ.mode, fromLevel: Number(QQ.level), askedAt: Date.now() });
-        text += `\n🏁 ${modeKo(QQ.mode)} Lv.${QQ.level} 연속 정답 ${streak}회!\n다음 레벨로 올릴까요?\n- 올릴게요: "올려"\n- 유지할게요: "유지"\n`;
-      } else {
-        // ✅ 난이도 안내는 get_question에서만 “1회성”으로 처리 (여기서는 반복 안내 X)
-        text += `\n다음 문제는 "다음"이라고 보내 주세요.`;
-      }
+      const text = `${graded.isCorrect ? "✅ 정답입니다!" : "❌ 오답입니다."}
+
+${header}
+- 내가 보낸 답: ${normalizeText(String(user_answer))}
+- 해석된 선택: ${dbgPicked}
+- 정답(저장값): ${ansRaw}
+- 해설: ${QQ.explanation ?? "(해설 없음)"}
+
+다음 문제는 "다음"이라고 보내 주세요.`;
 
       return { content: [{ type: "text", text }] };
     } catch (err) {
@@ -926,7 +683,7 @@ server.tool(
 /* ------------------------------- Tool: save_item ------------------------------- */
 server.tool(
   "save_item",
-  "단어/오답/메모를 review_items에 저장합니다. (payload는 없어도 됩니다)",
+  "단어/오답/메모를 review_items에 저장합니다. (payload 없으면 빈 객체로 저장)",
   {
     user_id: z.string().optional(),
     item_type: z.enum(["vocab", "mistake", "note"]),
@@ -985,19 +742,13 @@ server.tool(
     const text =
       `📌 복습 아이템 (${data?.length ?? 0}개)` +
       (data && data.length
-        ? "\n\n" +
+        ? "\n" +
           data
-            .map((it: any, idx: number) => {
-              const p = it.payload ?? {};
-              const mode = p.mode ? `${modeKo(p.mode)} ` : "";
-              const lv = p.level ? `Lv.${p.level}` : "";
-              return (
-                `${idx + 1}) [${it.item_type}] ${mode}${lv}\n` +
-                `- key: ${it.key}\n` +
-                `- payload: ${JSON.stringify(it.payload)}`
-              );
-            })
-            .join("\n\n")
+            .map(
+              (it: any, idx: number) =>
+                `${idx + 1}) [${it.item_type}] **${it.key}**\n- payload: ${JSON.stringify(it.payload)}`
+            )
+            .join("\n")
         : "\n(없음)");
 
     return { content: [{ type: "text", text }] };
@@ -1005,9 +756,14 @@ server.tool(
 );
 
 /* ------------------------------- Tool: get_learning_summary ------------------------------- */
+/**
+ * ✅ 유저 요청대로 "요약/정리"는 문제+답+설명까지 포함해야 해서,
+ * 기존의 숫자 요약은 유지하되, handle_user_message에서 "요약/정리" 키워드가 오면
+ * 오늘 푼 문제 전체를 상세로 뽑아 보내도록 함.
+ */
 server.tool(
   "get_learning_summary",
-  "기간(최근 N일) 기반 학습 요약을 제공합니다. (간단 통계용)",
+  "기간(최근 N일) 기반 학습 요약(숫자 요약)만 제공합니다.",
   { user_id: z.string().optional(), days: z.number().int().min(1).max(365).optional() },
   async (args) => {
     const parsed = GetLearningSummaryArgs.parse(args);
@@ -1039,245 +795,402 @@ server.tool(
 
     const savedTotal = saved?.length ?? 0;
     const savedVocab = (saved ?? []).filter((x: any) => x.item_type === "vocab").length;
-    const savedMistake = (saved ?? []).filter((x: any) => x.item_type === "mistake").length;
 
-    const text =
-      `📊 최근 ${days}일 요약(통계)\n` +
-      `- 퀴즈 시도: ${total}회\n` +
-      `- 오답: ${wrong}개\n` +
-      `- 저장 아이템: ${savedTotal}개 (단어 ${savedVocab}개 / 오답 ${savedMistake}개)`;
+    const text = `📊 최근 ${days}일 요약
+- 퀴즈 시도: ${total}회
+- 오답: ${wrong}개
+- 저장 아이템: ${savedTotal}개 (단어 ${savedVocab}개)`;
 
     return { content: [{ type: "text", text }] };
   }
 );
 
-/* ------------------------- Tool: handle_user_message ------------------------ */
+/* ------------------------------- Chat: today's full summary ------------------------------- */
+async function buildTodayFullSummary(user_id: string, opts?: { onlyWrong?: boolean }) {
+  const since = kstDayStartIso(new Date());
+
+  const logsQ = supabase
+    .from("study_logs")
+    .select("q_id, mode, level, is_correct, user_answer, created_at")
+    .eq("user_id", user_id)
+    .eq("event_type", "quiz_attempt")
+    .gte("created_at", since)
+    .order("created_at", { ascending: true });
+
+  if (opts?.onlyWrong) logsQ.eq("is_correct", false);
+
+  const { data: logs, error: lErr } = await logsQ;
+  if (lErr) throw lErr;
+
+  if (!logs || logs.length === 0) {
+    return {
+      logs: [],
+      text: opts?.onlyWrong ? "오늘 오답이 없습니다." : "오늘 푼 문제가 없습니다.",
+    };
+  }
+
+  const qIds = Array.from(new Set(logs.map((x: any) => String(x.q_id))));
+  const { data: qs, error: qErr } = await supabase
+    .from("questions")
+    .select("q_id, mode, level, prompt, choices, answer, explanation")
+    .in("q_id", qIds);
+
+  if (qErr) throw qErr;
+
+  const qMap = new Map<string, any>();
+  (qs ?? []).forEach((q: any) => qMap.set(String(q.q_id), q));
+
+  const lines: string[] = [];
+
+  lines.push(opts?.onlyWrong ? "📌 오늘 오답노트" : "📌 오늘 공부 정리(문제+정답+해설)");
+
+  logs.forEach((lg: any, idx: number) => {
+    const q = qMap.get(String(lg.q_id));
+    if (!q) return;
+
+    const mode = String(q.mode ?? lg.mode ?? "").toUpperCase();
+    const level = Number(q.level ?? lg.level ?? 0);
+    const prompt = String(q.prompt ?? "");
+    const choices = (q.choices ?? []) as string[];
+    const ans = String(q.answer ?? "");
+    const exp = String(q.explanation ?? "(해설 없음)");
+    const ua = String(lg.user_answer ?? "");
+    const correctMark = lg.is_correct ? "✅" : "❌";
+
+    lines.push(
+      `\n${idx + 1}) ${correctMark} ${mode} Lv.${level}\n` +
+        `${prompt}\n` +
+        `${choices.length ? choices.map((c: string, i: number) => `${i + 1}. ${c}`).join("\n") : "(선택지 없음)"}\n` +
+        `- 내 답: ${ua}\n` +
+        `- 정답: ${ans}\n` +
+        `- 해설: ${exp}\n` +
+        `- q_id: \`${q.q_id}\``
+    );
+  });
+
+  return { logs, text: lines.join("\n") };
+}
+
+/* ------------------------------- Similar review question ------------------------------- */
+async function pickSimilarQuestion(params: {
+  user_id: string;
+  mode: Mode;
+  level: number;
+  excludeQids: string[];
+}) {
+  const { user_id, mode, level, excludeQids } = params;
+
+  let query = supabase
+    .from("questions")
+    .select("q_id, mode, level, prompt, choices, answer, explanation, media")
+    .eq("mode", mode)
+    .eq("level", level)
+    .eq("is_active", true)
+    .limit(50);
+
+  if (excludeQids.length) query = query.not("q_id", "in", `(${excludeQids.join(",")})`);
+
+  const { data, error } = await query;
+  if (error) throw error;
+  if (!data || data.length === 0) return null;
+
+  const idx = Math.floor(Math.random() * data.length);
+  return data[idx] as any;
+}
+
+/* ------------------------------- Tool: handle_user_message ------------------------------- */
 server.tool(
   "handle_user_message",
-  "사용자 메시지 하나로 학습 흐름을 자동 처리합니다. (모드 선택/다음/정답 채점/난이도 조정/오늘 정리/오답노트/그만=오답노트 자동)",
-  { user_id: z.string().min(1).optional(), message: z.string().min(1) },
+  "사용자 메시지(자연어)로 학습 흐름을 제어합니다. (난이도 1회 안내, 요약/정리, 오답노트, 레벨 클리어, 다음 문제 등)",
+  { user_id: z.string().optional(), message: z.string() },
   async (args) => {
     try {
       const parsed = HandleUserMessageArgs.parse(args);
       const user_id = resolveUserId(parsed.user_id);
-      const msg = String(parsed.message ?? "").trim();
+      const message = normalizeText(parsed.message);
 
       await ensureUser(user_id, "toeic");
 
       // 유저 상태
-      const { data: u, error: uErr } = await supabase
+      const { data: uRow, error: uErr } = await supabase
         .from("users")
-        .select("current_level, last_mode")
+        .select("current_level, last_mode, placement_done")
         .eq("user_id", user_id)
         .maybeSingle();
       if (uErr) throw uErr;
 
-      let currentLevel = Number((u as any)?.current_level ?? 3);
-      let currentMode = ((u as any)?.last_mode ?? "toeic") as Mode;
+      const currentLevel = Number((uRow as any)?.current_level ?? 3);
+      const lastMode = ((uRow as any)?.last_mode ?? "toeic") as Mode;
 
-      // 0) 승급 응답 처리
-      const promo = awaitingPromotionDecision.get(user_id);
-      if (promo) {
-        if (isPromotionYes(msg)) {
-          const newLevel = Math.min(10, promo.fromLevel + 1);
-          await supabase.from("users").update({ current_level: newLevel, last_mode: promo.mode }).eq("user_id", user_id);
-          awaitingPromotionDecision.delete(user_id);
-
-          const recent = await getRecentAttemptedQids({ user_id, mode: promo.mode, limit: 150 });
-          const q = await pickRandomQuestionAvoiding(promo.mode, newLevel, recent);
-          if (!q) {
-            return { content: [{ type: "text", text: `✅ 레벨을 Lv.${newLevel}로 올렸어요.\n그런데 Lv.${newLevel} 문제를 찾지 못했습니다. questions 테이블에 문제를 추가해 주세요.` }] };
-          }
-
-          pendingByUser.set(user_id, { q_id: String(q.q_id), mode: promo.mode, level: Number(q.level), sent_at: new Date().toISOString() });
-
-          const choices = (q.choices ?? []) as string[];
-          const mediaMd = q.media?.image ? `\n\n![image](${q.media.image})\n` : "";
-
-          const text =
-            `✅ 레벨 업! ${modeKo(promo.mode)} Lv.${newLevel}\n\n` +
-            `🧩 ${modeKo(q.mode)} Lv.${q.level}\n` +
-            `${q.prompt}${mediaMd}\n\n` +
-            `${formatChoicesWithNumbers(choices)}\n\n` +
-            `정답은 **숫자(1~)** 또는 **A~E** 로 보내 주세요.`;
-
-          return { content: [{ type: "text", text }] };
-        }
-
-        if (isPromotionNo(msg)) {
-          awaitingPromotionDecision.delete(user_id);
-          return { content: [{ type: "text", text: `OK. ${modeKo(promo.mode)} Lv.${promo.fromLevel} 유지할게요.\n"다음"이라고 보내면 계속 진행합니다.` }] };
-        }
-        // 딴 말이면 계속 대기 상태 유지 (흐름 깨지 않게 그냥 다음 처리)
-      }
-
-      // 1) 그만/종료 => 오늘 오답노트 자동
-      if (isStop(msg)) {
-        const note = await buildTodayMistakeNoteWithReview(user_id);
-        return { content: [{ type: "text", text: `${note}\n\n(학습 종료)` }] };
-      }
-
-      // 2) 오늘 정리/요약
-      if (isSummary(msg)) {
-        const summary = await buildTodayFullSummary(user_id);
-        return { content: [{ type: "text", text: summary }] };
-      }
-
-      // 3) 오답노트
-      if (isMistakeNote(msg)) {
-        const note = await buildTodayMistakeNoteWithReview(user_id);
-        return { content: [{ type: "text", text: note }] };
-      }
-
-      // 4) 모드 변경
-      const maybeMode = parseModeFromMessage(msg);
-      if (maybeMode) {
-        currentMode = maybeMode;
-        const { error: upErr } = await supabase.from("users").update({ last_mode: currentMode }).eq("user_id", user_id);
-        if (upErr) throw upErr;
-
+      // -------------------- 0) "그만" => 자동 오답노트(오늘) --------------------
+      if (/^(그만|종료|끝|스톱|stop)$/i.test(message)) {
+        const wrong = await buildTodayFullSummary(user_id, { onlyWrong: true });
         return {
           content: [
             {
               type: "text",
-              text:
-                `OK. ${modeKo(currentMode)}로 할게요.\n` +
-                `현재 레벨: Lv.${currentLevel}\n\n` +
-                `문제 풀려면 "다음"이라고 보내 주세요.`,
+              text: `${wrong.text}\n\n(원하면) "오답 복습"이라고 보내면 비슷한 문제로 바로 확인할게요.`,
             },
           ],
         };
       }
 
-      // 5) 난이도 신호 (처음 1회 안내만, 신호는 언제든 반영)
-      if (isEasySignal(msg)) {
-        currentLevel = Math.min(10, currentLevel + 1);
-        const { error: upErr } = await supabase.from("users").update({ current_level: currentLevel }).eq("user_id", user_id);
-        if (upErr) throw upErr;
-        return { content: [{ type: "text", text: `난이도를 올렸어요. 현재 ${modeKo(currentMode)} Lv.${currentLevel}\n"다음"이라고 보내면 이어서 낼게요.` }] };
-      }
+      // -------------------- 1) Pending: 레벨 클리어 질문 응답 --------------------
+      const p = pending[user_id];
 
-      if (isHardSignal(msg)) {
-        currentLevel = Math.max(1, currentLevel - 1);
-        const { error: upErr } = await supabase.from("users").update({ current_level: currentLevel }).eq("user_id", user_id);
-        if (upErr) throw upErr;
-        return { content: [{ type: "text", text: `난이도를 내렸어요. 현재 ${modeKo(currentMode)} Lv.${currentLevel}\n"다음"이라고 보내면 이어서 낼게요.` }] };
-      }
+      if (p?.type === "level_clear") {
+        if (/^(ㅇㅇ|ㅇ|yes|y)$/i.test(message)) {
+          const nextLevel = Math.min(10, p.level + 1);
 
-      // 6) 답만 온 경우 => pending 있으면 채점, 없으면 안내
-      if (isAnswerToken(msg)) {
-        const pending = pendingByUser.get(user_id);
-        if (!pending) {
-          return { content: [{ type: "text", text: `지금 채점할 문제가 없어요. 먼저 "다음"이라고 보내서 문제를 받아주세요.` }] };
+          await supabase
+            .from("users")
+            .update({ current_level: nextLevel, last_mode: p.mode })
+            .eq("user_id", user_id);
+
+          pending[user_id] = undefined;
+
+          const q = await pickRandomQuestionForUser({ user_id, mode: p.mode, level: nextLevel });
+          if (!q) {
+            pending[user_id] = { type: "level_clear", mode: p.mode, level: nextLevel };
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: `🎉 ${p.mode.toUpperCase()} Lv.${nextLevel} 문제도 지금은 더 이상 출제할 게 없어요.\nDB에 문제를 더 추가해 주세요.`,
+                },
+              ],
+            };
+          }
+
+          const choices = (q.choices ?? []) as string[];
+          const header = `🧩 ${String(q.mode).toUpperCase()} Lv.${Number(q.level)}`;
+          const text = `👍 좋아요! ${p.mode.toUpperCase()} Lv.${nextLevel}로 이동했어요.\n\n${header}\n${q.prompt}\n\n${
+            choices.length ? choices.map((c: string, i: number) => `${i + 1}. ${c}`).join("\n") : "(선택지 없음)"
+          }\n\nq_id: \`${q.q_id}\`\n\n정답은 **숫자(1~)** 또는 **A~E**로 보내 주세요.`;
+          return { content: [{ type: "text", text }] };
         }
 
-        // submit_answer 내부 로직 수행(도구 호출 없이 직접)
-        const { data: q, error: qErr } = await supabase
-          .from("questions")
-          .select("q_id, mode, level, answer, explanation, choices, prompt, media")
-          .eq("q_id", pending.q_id)
-          .maybeSingle();
+        if (/^(ㄴㄴ|ㄴ|no|n)$/i.test(message)) {
+          pending[user_id] = { type: "post_clear_menu", mode: p.mode, level: p.level };
+          return {
+            content: [
+              {
+                type: "text",
+                text: `알겠어요.\n\n1) Lv.${p.level} 복습(오늘 오답 중심)\n2) 다른 모드(토익/문법/단어/여행/비즈니스)\n\n원하는 걸 숫자로 보내 주세요: 1 또는 2`,
+              },
+            ],
+          };
+        }
 
-        if (qErr) throw qErr;
+        return {
+          content: [
+            {
+              type: "text",
+              text: `다음 레벨로 갈지 선택해 주세요.\n- ㅇㅇ : 다음 레벨\n- ㄴㄴ : 복습/다른 모드`,
+            },
+          ],
+        };
+      }
+
+      if (p?.type === "post_clear_menu") {
+        if (/^1$/.test(message)) {
+          pending[user_id] = undefined;
+          const wrong = await buildTodayFullSummary(user_id, { onlyWrong: true });
+          return {
+            content: [
+              {
+                type: "text",
+                text: `${wrong.text}\n\n"오답 복습"이라고 보내면 비슷한 문제로 바로 확인할게요.`,
+              },
+            ],
+          };
+        }
+        if (/^2$/.test(message)) {
+          pending[user_id] = undefined;
+          return {
+            content: [
+              {
+                type: "text",
+                text: `어떤 모드로 할까요?\n- toeic / grammar / vocab / travel / business\n예) "단어" 또는 "vocab"`,
+              },
+            ],
+          };
+        }
+        return {
+          content: [
+            {
+              type: "text",
+              text: `1 또는 2로 선택해 주세요.\n1) Lv.${p.level} 복습\n2) 다른 모드`,
+            },
+          ],
+        };
+      }
+
+      // -------------------- 2) 모드 전환 --------------------
+      const modeMap: Record<string, Mode> = {
+        토익: "toeic",
+        toeic: "toeic",
+        문법: "grammar",
+        grammar: "grammar",
+        여행: "travel",
+        travel: "travel",
+        비즈니스: "business",
+        business: "business",
+        단어: "vocab",
+        vocab: "vocab",
+      };
+
+      const modeKey = Object.keys(modeMap).find((k) => message.toLowerCase() === k.toLowerCase());
+      if (modeKey) {
+        const m = modeMap[modeKey];
+        await supabase.from("users").update({ last_mode: m }).eq("user_id", user_id);
+
+        const q = await pickRandomQuestionForUser({ user_id, mode: m, level: currentLevel });
         if (!q) {
-          pendingByUser.delete(user_id);
-          return { content: [{ type: "text", text: `문제를 찾지 못했어요. "다음"이라고 보내면 새 문제를 낼게요.` }] };
+          pending[user_id] = { type: "level_clear", mode: m, level: currentLevel };
+          return {
+            content: [
+              {
+                type: "text",
+                text: `지금 ${m.toUpperCase()} Lv.${currentLevel}에서 낼 문제가 부족해요.\n다음 레벨로 갈까요?\n- ㅇㅇ / ㄴㄴ`,
+              },
+            ],
+          };
         }
-
-        const QQ = q as any;
-        const choices = (QQ.choices ?? []) as string[];
-        const graded = gradeAnswer({ choices, correctAnswer: QQ.answer, userAnswer: msg });
-
-        const { error: logErr } = await supabase.from("study_logs").insert({
-          user_id,
-          q_id: QQ.q_id,
-          event_type: "quiz_attempt",
-          ref_id: String(QQ.q_id),
-          mode: QQ.mode,
-          level: QQ.level,
-          is_correct: graded.isCorrect,
-          user_answer: graded.userPickValue ?? graded.raw ?? msg,
-          signal: "neutral",
-        });
-        if (logErr) throw logErr;
-
-        await autoSaveMistake({ user_id, q: QQ, graded, user_answer: msg });
-
-        // pending clear
-        pendingByUser.delete(user_id);
-
-        const dbgPicked =
-          graded.userPickIndex != null
-            ? `${graded.userPickIndex + 1}번${choices[graded.userPickIndex] ? ` (${choices[graded.userPickIndex]})` : ""}`
-            : graded.raw;
-
-        let text =
-          `${graded.isCorrect ? "✅ 정답입니다!" : "❌ 오답입니다."}\n\n` +
-          `🧩 ${modeKo(QQ.mode)} Lv.${QQ.level}\n` +
-          `- 내 답: ${msg}\n` +
-          `- 해석된 선택: ${dbgPicked}\n` +
-          `- 정답: ${String(QQ.answer ?? "").trim()}\n` +
-          `- 해설: ${QQ.explanation ?? "(해설 없음)"}\n`;
-
-        // 승급 제안 체크
-        const streak = await getConsecutiveCorrectAtLevel({ user_id, mode: QQ.mode, level: Number(QQ.level), limit: 30 });
-        if (streak >= 5) {
-          awaitingPromotionDecision.set(user_id, { mode: QQ.mode, fromLevel: Number(QQ.level), askedAt: Date.now() });
-          text += `\n🏁 ${modeKo(QQ.mode)} Lv.${QQ.level} 연속 정답 ${streak}회!\n다음 레벨로 올릴까요?\n- 올릴게요: "올려"\n- 유지: "유지"\n`;
-        } else {
-          text += `\n다음 문제는 "다음"이라고 보내 주세요.`;
-        }
-
-        return { content: [{ type: "text", text }] };
-      }
-
-      // 7) 다음/계속 => 문제 제공
-      if (isNext(msg) || msg === "시작" || msg === "영어공부할래") {
-        // 영어공부할래면 모드부터 한번 물어보기
-        if (msg === "영어공부할래") {
-          return { content: [{ type: "text", text: `어떤 걸로 할까요?\n- 토익 / 문법 / 여행 / 비즈니스 / 단어\n원하는 모드를 말해줘.` }] };
-        }
-
-        // 현재 모드/레벨로 문제
-        const recent = await getRecentAttemptedQids({ user_id, mode: currentMode, limit: 150 });
-        const q = await pickRandomQuestionAvoiding(currentMode, currentLevel, recent);
-        if (!q) {
-          return { content: [{ type: "text", text: `${modeKo(currentMode)} Lv.${currentLevel} 문제를 찾지 못했어요. questions 테이블에 문제를 추가해 주세요.` }], isError: true };
-        }
-
-        pendingByUser.set(user_id, { q_id: String(q.q_id), mode: currentMode, level: Number(q.level), sent_at: new Date().toISOString() });
 
         const choices = (q.choices ?? []) as string[];
-        const mediaMd = q.media?.image ? `\n\n![image](${q.media.image})\n` : "";
+        const header = `🧩 ${String(q.mode).toUpperCase()} Lv.${Number(q.level)}`;
+        const text = `모드를 ${m.toUpperCase()}로 바꿨어요.\n\n${header}\n${q.prompt}\n\n${
+          choices.length ? choices.map((c: string, i: number) => `${i + 1}. ${c}`).join("\n") : "(선택지 없음)"
+        }\n\nq_id: \`${q.q_id}\`\n\n정답은 **숫자(1~)** 또는 **A~E**로 보내 주세요.`;
+        return { content: [{ type: "text", text }] };
+      }
 
-        const nudge = shouldShowDifficultyNudge(user_id)
-          ? `\n\n난이도는 한 번만 물어볼게요.\n현재 레벨이 **쉬우면 "쉬워요"**, **어려우면 "어려워요"**라고 말해주면 다음부터 조정할게요.`
-          : "";
+      // -------------------- 3) 난이도 신호(쉬워요/어려워요) --------------------
+      // "정답 1 + 쉬워요" 같이 와도 처리되도록, 메시지 안에 포함되면 signal로 반영
+      const hasEasy = /쉬워요|쉬움|easy/i.test(message);
+      const hasHard = /어려워요|어려움|hard/i.test(message);
 
+      // -------------------- 4) 오늘 정리/요약 --------------------
+      if (/(요약|정리)\s*$/i.test(message) || /(오늘.*(요약|정리))/i.test(message)) {
+        const sum = await buildTodayFullSummary(user_id, { onlyWrong: false });
+        return { content: [{ type: "text", text: sum.text }] };
+      }
+
+      // -------------------- 5) 오답노트 --------------------
+      if (/(오답노트|오답\s*정리|틀린문제|오늘\s*오답)/i.test(message)) {
+        const wrong = await buildTodayFullSummary(user_id, { onlyWrong: true });
+
+        // 오답이 있으면 "유사문제 복습"까지 이어주기
+        if (wrong.logs.length > 0) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `${wrong.text}\n\n"오답 복습"이라고 보내면 비슷한 문제로 바로 확인할게요.`,
+              },
+            ],
+          };
+        }
+        return { content: [{ type: "text", text: wrong.text }] };
+      }
+
+      if (/(오답\s*복습)/i.test(message)) {
+        // 오늘 오답 중 첫 번째 기준으로 유사 문제 1개 출제
+        const wrong = await buildTodayFullSummary(user_id, { onlyWrong: true });
+        if (wrong.logs.length === 0) {
+          return { content: [{ type: "text", text: "오늘 오답이 없어서 복습 문제를 낼 게 없어요." }] };
+        }
+
+        const first = wrong.logs.find((x: any) => x.is_correct === false) as any;
+        const mode = (first?.mode ?? lastMode) as Mode;
+        const level = Number(first?.level ?? currentLevel);
+        const exclude = wrong.logs.map((x: any) => String(x.q_id));
+
+        const sim = await pickSimilarQuestion({ user_id, mode, level, excludeQids: exclude });
+        if (!sim) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `오늘 오답과 비슷한(같은 레벨/모드) 문제가 부족해요.\nDB에 문제를 더 추가해 주세요.`,
+              },
+            ],
+          };
+        }
+
+        const choices = (sim.choices ?? []) as string[];
+        const header = `🧩 ${String(sim.mode).toUpperCase()} Lv.${Number(sim.level)}`;
+        const text = `🔁 오답 복습(유사 문제)\n\n${header}\n${sim.prompt}\n\n${
+          choices.length ? choices.map((c: string, i: number) => `${i + 1}. ${c}`).join("\n") : "(선택지 없음)"
+        }\n\nq_id: \`${sim.q_id}\`\n\n정답은 **숫자(1~)** 또는 **A~E**로 보내 주세요.`;
+        return { content: [{ type: "text", text }] };
+      }
+
+      // -------------------- 6) 시작/다음 => 문제 출제 --------------------
+      if (/^(시작|다음|계속|문제|출제)$/i.test(message)) {
+        // 난이도 안내는 최초 1회만
+        const intro = difficultyPromptShown[user_id]
+          ? ""
+          : `정답은 숫자(1~) 또는 A~E로 보내 주세요.\n난이도는 한 번만 물어볼게요.\n현재 레벨이 쉬우면 "쉬워요", 어려우면 "어려워요"라고 말해주면 다음부터 조정할게요.\n\n`;
+
+        difficultyPromptShown[user_id] = true;
+
+        // signal이 들어오면 유저 레벨 조정(바로 반영)
+        let newLevel = currentLevel;
+        if (hasEasy) newLevel = Math.min(10, currentLevel + 1);
+        if (hasHard) newLevel = Math.max(1, currentLevel - 1);
+
+        if (newLevel !== currentLevel) {
+          await supabase.from("users").update({ current_level: newLevel }).eq("user_id", user_id);
+        }
+
+        const q = await pickRandomQuestionForUser({ user_id, mode: lastMode, level: newLevel });
+
+        if (!q) {
+          const ex = await isLevelExhausted(user_id, lastMode, newLevel);
+          if (ex.exhausted) {
+            pending[user_id] = { type: "level_clear", mode: lastMode, level: newLevel };
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: `🎉 ${lastMode.toUpperCase()} Lv.${newLevel} 레벨을 클리어했어요!\n\n다음 레벨(Lv.${Math.min(
+                    10,
+                    newLevel + 1
+                  )})로 넘어갈까요?\n- ㅇㅇ / ㄴㄴ`,
+                },
+              ],
+            };
+          }
+
+          return { content: [{ type: "text", text: "문제가 부족해요. DB에 문제를 더 추가해 주세요." }], isError: true };
+        }
+
+        const choices = (q.choices ?? []) as string[];
+        const header = `🧩 ${String(q.mode).toUpperCase()} Lv.${Number(q.level)}`;
         const text =
-          `🧩 ${modeKo(q.mode)} Lv.${q.level}\n` +
-          `${q.prompt}${mediaMd}\n\n` +
-          `${formatChoicesWithNumbers(choices)}\n\n` +
-          `정답은 **숫자(1~)** 또는 **A~E** 로 보내 주세요.` +
-          nudge;
+          intro +
+          `${header}\n${q.prompt}\n\n${
+            choices.length ? choices.map((c: string, i: number) => `${i + 1}. ${c}`).join("\n") : "(선택지 없음)"
+          }\n\nq_id: \`${q.q_id}\`\n\n정답은 **숫자(1~)** 또는 **A~E**로 보내 주세요.`;
 
         return { content: [{ type: "text", text }] };
       }
 
-      // 8) 그 외: 짧은 도움말
+      // -------------------- 7) 기본 응답(가이드) --------------------
       return {
         content: [
           {
             type: "text",
             text:
-              `할 수 있는 것:\n` +
-              `- "토익/문법/여행/비즈니스/단어" (모드 변경)\n` +
-              `- "다음" (문제 받기)\n` +
-              `- 정답만 보내기: 1 또는 A\n` +
-              `- "쉬워요" / "어려워요" (레벨 조정)\n` +
-              `- "정리" 또는 "요약" (오늘 푼 문제 전체: 문제+답+해설)\n` +
-              `- "오답노트" (오늘 오답: 문제+답+해설 + 복습문제 1개)\n` +
-              `- "그만" (자동으로 오늘 오답노트 출력 후 종료)`,
+              `원하는 동작을 이렇게 말해보세요:\n` +
+              `- "시작" / "다음"\n` +
+              `- "쉬워요" / "어려워요"\n` +
+              `- "요약" / "정리" (오늘 푼 문제+정답+해설)\n` +
+              `- "오답노트" / "틀린문제" / "오답 복습"\n` +
+              `- 모드 변경: "토익" / "문법" / "단어" / "여행" / "비즈니스"\n` +
+              `- "그만" (자동 오늘 오답노트)`,
           },
         ],
       };
@@ -1346,7 +1259,6 @@ app.post("/mcp", async (req: Request, res: Response) => {
 
     await transport.handleRequest(req, res, req.body);
   } catch (err) {
-    // eslint-disable-next-line no-console
     console.error("[/mcp POST] error:", err);
     safeJsonRpcError(res);
   }
@@ -1382,7 +1294,6 @@ app.get("/mcp", async (req: Request, res: Response) => {
 
     await transport.handleRequest(req, res);
   } catch (err) {
-    // eslint-disable-next-line no-console
     console.error("[/mcp GET] error:", err);
     safeJsonRpcError(res);
   }
@@ -1391,6 +1302,5 @@ app.get("/mcp", async (req: Request, res: Response) => {
 /* --------------------------------- Listen -------------------------------- */
 const PORT = Number(process.env.PORT || 3000);
 app.listen(PORT, "0.0.0.0", () => {
-  // eslint-disable-next-line no-console
   console.log(`✅ MCP HTTP Server running: http://0.0.0.0:${PORT}/mcp`);
 });
